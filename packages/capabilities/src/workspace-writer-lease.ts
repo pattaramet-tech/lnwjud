@@ -247,7 +247,7 @@ export class SqliteWorkspaceWriterLease implements WorkspaceWriterLeasePort {
   }
 
   public async renew(workspaceId: string, clientId: string, sessionId: string, proof: WorkspaceWriterLeaseProof, ttlSeconds: number): Promise<Result<{ expiresAt: string }>> {
-    if (!validIdentity(workspaceId, clientId, sessionId) || !validTtl(ttlSeconds)) return invalid();
+    if (!validIdentity(workspaceId, clientId, sessionId) || !validProof(proof) || !validTtl(ttlSeconds)) return invalid();
     try {
       return this.transaction((db) => {
         const row = this.row(db, workspaceId);
@@ -261,7 +261,7 @@ export class SqliteWorkspaceWriterLease implements WorkspaceWriterLeasePort {
   }
 
   public async release(workspaceId: string, clientId: string, sessionId: string, proof: WorkspaceWriterLeaseProof): Promise<Result<void>> {
-    if (!validIdentity(workspaceId, clientId, sessionId)) return invalid();
+    if (!validIdentity(workspaceId, clientId, sessionId) || !validProof(proof)) return invalid();
     const globalProbe = this.globalExclusion === undefined ? undefined
       : await this.globalExclusion.holdExclusiveProbe(workspaceId).catch(() => unavailable());
     if (globalProbe !== undefined && !globalProbe.ok) return globalProbe;
@@ -346,6 +346,15 @@ function matches(row: LeaseRow, clientId: string, sessionId: string, proof: Work
 }
 function validIdentity(...identities: string[]): boolean { return identities.every((v) => typeof v === 'string' && v.length > 0 && v.length <= 256); }
 function validTtl(value: number): boolean { return Number.isInteger(value) && value >= 30 && value <= 3600; }
+/** Mirror the MCP proof schema before any reservation probe or SQLite mutation. */
+function validProof(proof: unknown): proof is WorkspaceWriterLeaseProof {
+  if (typeof proof !== 'object' || proof === null || Array.isArray(proof)) return false;
+  const candidate = proof as WorkspaceWriterLeaseProof;
+  return typeof candidate.leaseId === 'string'
+    && /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/.test(candidate.leaseId)
+    && validIdentity(candidate.leaseToken)
+    && Number.isSafeInteger(candidate.generation) && candidate.generation >= 0;
+}
 function processAlive(pid: number): 'alive' | 'dead' | 'unknown' {
   try { process.kill(pid, 0); return 'alive'; }
   catch (e) { return (e as NodeJS.ErrnoException).code === 'ESRCH' ? 'dead' : 'unknown'; }

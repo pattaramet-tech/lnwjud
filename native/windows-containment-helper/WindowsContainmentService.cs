@@ -60,6 +60,7 @@ internal static class WindowsContainmentService
     private sealed record RpcRequest(int Protocol, string Command, ServiceAttemptIdentity? Identity, string? ReservationKey, string? OperationDigest, ServiceProcessOperation? Operation,
         string? ControlCommand = null, JsonElement? ControlRequest = null, ServiceOutputCursor? OutputCursor = null, string? RecordedAt = null);
     private sealed record RpcResponse(int Protocol, bool Ok, object? Result, string? Error);
+    private sealed record ServiceReadinessObservation(int Protocol, string State);
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "StartServiceCtrlDispatcherW")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -164,6 +165,7 @@ internal static class WindowsContainmentService
                 using var caller = AuthenticatedPipeCaller.Capture(pipe);
                 object result = request.Command switch
                 {
+                    "check_readiness" => CheckReadiness(ledger),
                     "prepare" => Prepare(ledger, request, caller.Sid),
                     "run" => Run(ledger, runtime, request, caller),
                     "inspect" => Inspect(runtime, request, caller.Sid),
@@ -202,6 +204,12 @@ internal static class WindowsContainmentService
                 catch { }
             }
         }
+    }
+
+    private static ServiceReadinessObservation CheckReadiness(ServiceAttemptLedger ledger)
+    {
+        ledger.CheckAvailability();
+        return new ServiceReadinessObservation(3, "ready");
     }
 
     private static ServiceAttemptObservation Run(ServiceAttemptLedger ledger, WindowsServiceProcessRuntime runtime, RpcRequest request, AuthenticatedPipeCaller caller)

@@ -17,6 +17,39 @@ function fixture(respond: (request: WindowsContainmentRpcRequest) => Promise<unk
 }
 
 describe('service-owned attempt handles', () => {
+  it('checks service readiness without dispatch or terminal proof', async () => {
+    const f = fixture(async () => ({ protocol: 3, state: 'ready' }));
+    expect(await f.authority.checkServiceAvailability()).toEqual({ state: 'available' });
+    expect(await f.authority.checkServiceAvailability()).toEqual({ state: 'available' });
+    const [first, second] = f.request.mock.calls.map(([request]) => request);
+    expect(first).toMatchObject({ command: 'check_readiness', identity: { ownerClientId: 'lnwjud-containment-readiness' } });
+    expect(second?.identity.attemptId).not.toBe(first?.identity.attemptId);
+    expect(first?.identity).not.toEqual(binding);
+    expect(f.startWatcher).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['SERVICE_ENDPOINT_NOT_INSTALLED', 'SERVICE_ENDPOINT_NOT_INSTALLED'],
+    ['SERVICE_ENDPOINT_PACKAGE_MISMATCH', 'SERVICE_ENDPOINT_PACKAGE_MISMATCH'],
+    ['ATTEMPT_STORE_UNAVAILABLE', 'ATTEMPT_STORE_UNAVAILABLE'],
+    ['NATIVE_SERVICE_RPC_TIMEOUT', 'NATIVE_SERVICE_RPC_TIMEOUT'],
+    ['ATTEMPT_OWNER_MISMATCH', 'ATTEMPT_OWNER_MISMATCH'],
+    ['SERVICE_OWNER_MISMATCH', 'SERVICE_OWNER_MISMATCH'],
+    ['SERVICE_COMMAND_UNSUPPORTED', 'SERVICE_COMMAND_UNSUPPORTED'],
+    ['C:\\Users\\private\\secret.txt', 'NATIVE_SERVICE_READINESS_UNAVAILABLE'],
+  ])('fails readiness closed for %s without exposing private errors', async (message, reason) => {
+    const f = fixture(async () => { throw new Error(message); });
+    expect(await f.authority.checkServiceAvailability()).toEqual({ state: 'unavailable', reason });
+    expect(f.request.mock.calls.map(([request]) => request.command)).toEqual(['check_readiness']);
+    expect(f.startWatcher).not.toHaveBeenCalled();
+  });
+
+  it.each([prepared, running, terminal, { identity: binding, phase: 2, reservationHeld: false },
+    { protocol: 2, state: 'ready' }, { protocol: 3, state: 'unavailable' }, { state: 'ready' }, { protocol: 3, state: 'ready', phase: 2 }])('does not infer service availability from invalid readiness or attempt observation %#', async (response) => {
+    const f = fixture(async () => response);
+    expect(await f.authority.checkServiceAvailability()).toEqual({ state: 'unavailable', reason: 'NATIVE_SERVICE_READINESS_UNVERIFIED' });
+  });
+
   it('submits once without a watcher and coalesces concurrent identical submissions', async () => {
     const f = fixture(async (request) => request.command === 'prepare' ? prepared : running);
     const [first, second] = await Promise.all([f.authority.submitProcess(input), f.authority.submitProcess(input)]);

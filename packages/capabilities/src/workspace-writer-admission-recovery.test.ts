@@ -36,6 +36,9 @@ function createMockAuthority(root: string): MockAuthorityContext {
 
   const client: WindowsContainmentServiceClient = {
     async request<T>(request: WindowsContainmentRpcRequest): Promise<T> {
+      if (request.command === 'check_readiness') {
+        return { protocol: 3, state: 'ready' } as T;
+      }
       if (request.command === 'cancel') {
         cancelled.push(request.identity.attemptId);
         currentPhase = 4;
@@ -294,6 +297,7 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
       requestDigest: digest,
       mutationKind: 'opaque',
       nativeBinding: binding,
+      nativeReceiptPath: path.join(taskDir, 'containment.receipt.json'),
       ownerClientId: clientId,
       ownerWorkspaceId: workspaceId,
     });
@@ -349,6 +353,7 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
       requestDigest: digest,
       mutationKind: 'opaque',
       nativeBinding: binding,
+      nativeReceiptPath: path.join(taskDir, 'containment.receipt.json'),
       ownerClientId: clientId,
       ownerWorkspaceId: workspaceId,
     });
@@ -430,6 +435,7 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
       requestDigest: digest,
       mutationKind: 'opaque',
       nativeBinding: binding,
+      nativeReceiptPath: path.join(taskDir, 'containment.receipt.json'),
       ownerClientId: clientId,
       ownerWorkspaceId: workspaceId,
     });
@@ -592,6 +598,7 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
       requestDigest: digest,
       mutationKind: 'opaque',
       nativeBinding: binding,
+      nativeReceiptPath: path.join(taskDir, 'containment.receipt.json'),
       ownerClientId: clientId,
       ownerWorkspaceId: workspaceId,
     });
@@ -665,6 +672,7 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
       requestDigest: digest,
       mutationKind: 'opaque',
       nativeBinding: binding,
+      nativeReceiptPath: path.join(taskDir, 'containment.receipt.json'),
       ownerClientId: clientId,
       ownerWorkspaceId: workspaceId,
     });

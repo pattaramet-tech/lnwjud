@@ -29,7 +29,7 @@ internal static class ServiceEndpointIdentity
     [DllImport("kernel32.dll")] private static extern nint GetCurrentProcess();
     [DllImport("kernel32.dll", SetLastError = true)] private static extern SafeProcessHandle OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out uint pid);
-    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetExitCodeProcess(SafeProcessHandle process, out uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetProcessTimes(SafeProcessHandle process, out long creation, out long exit, out long kernel, out long user);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool QueryFullProcessImageName(nint process, uint flags, StringBuilder path, ref uint size);
     [DllImport("advapi32.dll", SetLastError = true)] private static extern bool OpenProcessToken(nint process, uint access, out SafeAccessTokenHandle token);
     [DllImport("advapi32.dll", SetLastError = true)] private static extern bool GetKernelObjectSecurity(nint handle, uint information, byte[]? descriptor, uint size, out uint needed);
@@ -131,7 +131,7 @@ internal static class ServiceEndpointIdentity
         {
             package.RequireActive();
             RequireService(service, pid);
-            if (PipePid(pipe) != pid || !GetExitCodeProcess(process, out var exitCode) || exitCode != 259)
+            if (PipePid(pipe) != pid || !ProcessStillRunning(process))
                 throw new IOException("SERVICE_ENDPOINT_RESTARTED");
         }
 
@@ -141,6 +141,16 @@ internal static class ServiceEndpointIdentity
             process.Dispose();
             _ = CloseServiceHandle(service);
         }
+    }
+
+    internal static bool ProcessStillRunning(SafeProcessHandle process)
+    {
+        // The retained handle pins the verified process instance across PID reuse.
+        // Exit code 259 is ambiguous; a successful query has a zero exit FILETIME
+        // only while that instance is running, with no additional process rights.
+        if (process.IsInvalid || process.IsClosed) return false;
+        try { return GetProcessTimes(process, out _, out var exit, out _, out _) && exit == 0; }
+        catch (ObjectDisposedException) { return false; } // Concurrent SafeHandle disposal.
     }
 
     // This is a negative availability check, never evidence that a service is trusted or running.

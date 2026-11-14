@@ -71,8 +71,13 @@ export function workspaceTools(context: McpToolContext): McpToolDefinition[] {
       description: 'Release an owned workspace writer lease only when no fenced invocation is active.',
       permission: 'WRITE', annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: workspaceWriterLeaseProofActionSchema,
-      handler: async (input) => context.services.workspaceWriterLease === undefined ? missingService()
-        : context.services.workspaceWriterLease.release(input.workspaceId, context.actor.clientId, context.actor.sessionId ?? context.actor.clientId, input.writerLease),
+      // The lease port release resolves to void, but every tool advertises an
+      // output schema, so the success response must carry structured content.
+      handler: async (input) => {
+        if (context.services.workspaceWriterLease === undefined) return missingService();
+        const released = await context.services.workspaceWriterLease.release(input.workspaceId, context.actor.clientId, context.actor.sessionId ?? context.actor.clientId, input.writerLease);
+        return released.ok ? ok({ released: true, workspaceId: input.workspaceId }) : released;
+      },
     }),
     defineTool({
       name: 'workspace_register',

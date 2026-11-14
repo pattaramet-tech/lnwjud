@@ -18,7 +18,7 @@ const request = { taskId: 'shell-probe', requestDigest: 'a'.repeat(64), ownerCli
 describe('managed writer and durable shell admission', () => {
   it.skipIf(process.platform === 'darwin')('keeps unknown managed writers globally fenced without consuming the durable shell budget', async () => {
     const root = await fixture();
-    const admission = new SharedManagedWriterAdmission(root);
+    const admission = new SharedManagedWriterAdmission(root, undefined, 'linux');
     for (let i = 0; i < 17; i += 1) {
       expect(await admission.enter({ actorClientId: 'writer', workspaceId: `workspace-${i}`, kind: 'uncontained_process' })).toMatchObject({ ok: true });
     }
@@ -41,7 +41,7 @@ describe('managed writer and durable shell admission', () => {
   it.skipIf(process.platform === 'darwin').each([undefined, 1])('shows aggregate reservations even when the requested task page is empty (limit %s)', async (limit) => {
     const root = await fixture();
     const taskRoot = path.join(root, 'tasks');
-    const held = await new SharedManagedWriterAdmission(taskRoot).enter({ actorClientId: 'private-client', actorSessionId: 'private-session', workspaceId: 'private-workspace', kind: 'uncontained_process' });
+    const held = await new SharedManagedWriterAdmission(taskRoot, undefined, 'linux').enter({ actorClientId: 'private-client', actorSessionId: 'private-session', workspaceId: 'private-workspace', kind: 'uncontained_process' });
     expect(held.ok).toBe(true);
     const backend = new ShellCapabilityBackend({ allowedRoots: [root], taskStateDirectory: taskRoot });
     const response = await backend.execute({ operation: 'list', ...(limit === undefined ? {} : { limit }) });
@@ -67,7 +67,7 @@ describe('managed writer and durable shell admission', () => {
 
   it.skipIf(process.platform === 'darwin')('never treats corrupt reservation readback as successful release', async () => {
     const root = await fixture();
-    const admitted = await new SharedManagedWriterAdmission(root).enter({ actorClientId: 'writer', workspaceId: 'workspace', kind: 'uncontained_process' });
+    const admitted = await new SharedManagedWriterAdmission(root, undefined, 'linux').enter({ actorClientId: 'writer', workspaceId: 'workspace', kind: 'uncontained_process' });
     expect(admitted.ok).toBe(true);
     if (!admitted.ok) return;
     const directory = path.join(root, '.index', 'v1', 'active');

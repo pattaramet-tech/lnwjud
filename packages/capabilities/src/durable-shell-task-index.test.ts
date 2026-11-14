@@ -1,11 +1,22 @@
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DurableShellTaskIndex } from './durable-shell-task-index.js';
+import { DurableShellTaskIndex, durableTaskIndexDiagnosticError, type DurableMutationKind, type DurableTaskReservation } from './durable-shell-task-index.js';
 
 const temporaryRoots: string[] = [];
+
+function nativeReservation(root: string, mutationKind: DurableMutationKind = 'opaque'): DurableTaskReservation {
+  return {
+    taskId: 'bound-writer', requestDigest: 'a'.repeat(64), ownerClientId: 'owner', ownerWorkspaceId: 'workspace',
+    mutationKind, nativeReceiptPath: path.join(root, 'bound-writer', 'containment.receipt.json'),
+    nativeBinding: {
+      taskId: 'bound-writer', reservationId: 'bound-writer', attemptId: 'bound-writer-attempt', generation: 1,
+      requestDigest: 'a'.repeat(64), ownerClientId: 'owner', ownerSessionId: 'session', workspaceId: 'workspace',
+    },
+  };
+}
 
 afterEach(async () => {
   await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, {
@@ -34,12 +45,137 @@ describe('DurableShellTaskIndex', () => {
         taskId: 'blocked', requestDigest: 'a'.repeat(64), ownerClientId: 'owner',
       })).toMatchObject({
         ok: false,
-        error: { code: 'INTERNAL_ERROR', message: 'Durable task index lock is busy', recoverable: true },
+        error: {
+          code: 'CONFLICT', message: expect.stringContaining('Durable task index lock is busy'), recoverable: true,
+          details: { reason: 'DURABLE_TASK_INDEX_LOCK_BUSY', retry_after_ms: 15 },
+        },
       });
     } finally {
       clock.mockRestore();
     }
     expect(await index.hasReservation('blocked', 'a'.repeat(64))).toBe(false);
+    await rm(path.join(root, '.index', 'v1', 'index.lock'));
+    expect(await index.reserve({
+      taskId: 'blocked', requestDigest: 'a'.repeat(64), ownerClientId: 'owner',
+    })).toMatchObject({ ok: true, value: { created: true } });
+  });
+
+  it('reports launch-journal lock contention without leaking private paths', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-index-journal-contention-'));
+    temporaryRoots.push(root);
+    const index = new DurableShellTaskIndex(root, { maxConcurrentTasks: 1, inspectTask: async () => 'active' as const });
+    await index.initialize();
+    await writeFile(path.join(root, '.index', 'v1', 'index.lock'), JSON.stringify({
+      version: 1, pid: process.pid, acquiredAt: new Date().toISOString(),
+    }));
+    const start = Date.now();
+    let ticks = 0;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => start + (ticks++ * 10_001));
+    try {
+      const result = await index.listLaunches({ limit: 1 });
+      expect(result).toMatchObject({
+        ok: false, error: {
+          code: 'CONFLICT', recoverable: true,
+          details: { reason: 'DURABLE_TASK_INDEX_LOCK_BUSY', retry_after_ms: 15 },
+        },
+      });
+      expect(JSON.stringify(result)).not.toContain(root);
+      expect(JSON.stringify(result)).not.toContain(String(process.pid));
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each(['opaque', 'synchronous_mutation', 'opaque_contained_process'] as const)(
+    'retains a native-bound %s after restart until independent terminal evidence exists', async (mutationKind) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-index-bound-terminal-proof-'));
+      temporaryRoots.push(root);
+      const reservation = nativeReservation(root, mutationKind);
+      const options = {
+        maxConcurrentTasks: 4,
+        inspectTask: vi.fn(async () => 'terminal' as const),
+        isProcessProvenGone: (): boolean => true,
+        verifyContainedTermination: async (): Promise<boolean> => false,
+      };
+      const first = new DurableShellTaskIndex(root, options);
+      expect(await first.reserve(reservation)).toMatchObject({ ok: true });
+      const restarted = new DurableShellTaskIndex(root, options);
+      const writer = { taskId: 'import', requestDigest: 'b'.repeat(64), ownerClientId: 'owner', mutationKind: 'repository_import' as const };
+      expect(await restarted.reserve(writer)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+      await restarted.release(reservation.taskId, reservation.requestDigest);
+      expect(await restarted.hasReservation(reservation.taskId, reservation.requestDigest)).toBe(true);
+      expect(options.inspectTask).not.toHaveBeenCalled();
+
+      const verified = new DurableShellTaskIndex(root, { ...options, verifyContainedTermination: async (): Promise<boolean> => true });
+      expect(await verified.reserve(writer)).toMatchObject({ ok: true, value: { created: true } });
+      expect(await verified.hasReservation(reservation.taskId, reservation.requestDigest)).toBe(false);
+    },
+  );
+
+  it('rechecks native generation and session after terminal evidence returns', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-index-native-release-race-'));
+    temporaryRoots.push(root);
+    const reservation = nativeReservation(root);
+    const initial = new DurableShellTaskIndex(root, { maxConcurrentTasks: 4, inspectTask: async () => 'unknown' as const });
+    expect(await initial.reserve(reservation)).toMatchObject({ ok: true });
+    let entered!: () => void;
+    let resume!: () => void;
+    const started = new Promise<void>((resolve): void => { entered = resolve; });
+    const stalled = new Promise<void>((resolve): void => { resume = resolve; });
+    const releasing = new DurableShellTaskIndex(root, {
+      maxConcurrentTasks: 4, inspectTask: async () => 'terminal' as const,
+      verifyContainedTermination: async (): Promise<boolean> => { entered(); await stalled; return true; },
+    });
+    const pending = releasing.release(reservation.taskId, reservation.requestDigest);
+    await started;
+    const markerPath = path.join(root, '.index', 'v1', 'active', createHash('sha256').update(reservation.taskId).digest('hex') + '.json');
+    const original = JSON.parse(await readFile(markerPath, 'utf8')) as Record<string, unknown>;
+    const replacement = { ...original, nativeBinding: { ...reservation.nativeBinding, generation: 2, ownerSessionId: 'replacement-session' } };
+    await writeFile(markerPath, JSON.stringify(replacement));
+    resume();
+    await pending;
+    expect(JSON.parse(await readFile(markerPath, 'utf8'))).toEqual(replacement);
+    const restarted = new DurableShellTaskIndex(root, {
+      maxConcurrentTasks: 4, inspectTask: async () => 'terminal' as const,
+      verifyContainedTermination: async (): Promise<boolean> => false,
+    });
+    expect(await restarted.reserve({
+      taskId: 'import', requestDigest: 'b'.repeat(64), ownerClientId: 'owner', mutationKind: 'repository_import',
+    })).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    expect(await restarted.hasReservation(reservation.taskId, reservation.requestDigest)).toBe(true);
+  });
+
+  it('retains an interrupted native recovery and obtains new proof after restart', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-index-interrupted-recovery-'));
+    temporaryRoots.push(root);
+    const reservation = nativeReservation(root);
+    const first = new DurableShellTaskIndex(root, { maxConcurrentTasks: 4, inspectTask: async () => 'unknown' as const });
+    expect(await first.reserve(reservation)).toMatchObject({ ok: true });
+    const recovering = new DurableShellTaskIndex(root, {
+      maxConcurrentTasks: 4, inspectTask: async () => 'terminal' as const,
+      verifyContainedTermination: async (): Promise<boolean> => true,
+      removeFile: async (filename, options): Promise<void> => {
+        if (path.dirname(filename.toString()).endsWith(`${path.sep}active`)) throw new Error('interrupted before marker mutation');
+        await rm(filename, options);
+      },
+    });
+    const writer = { taskId: 'import', requestDigest: 'b'.repeat(64), ownerClientId: 'owner', mutationKind: 'repository_import' as const };
+    expect(await recovering.reserve(writer)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(await recovering.hasReservation(reservation.taskId, reservation.requestDigest)).toBe(true);
+
+    let transportRecovered = false;
+    const restarted = new DurableShellTaskIndex(root, {
+      maxConcurrentTasks: 4, inspectTask: async () => 'terminal' as const,
+      verifyContainedTermination: async (): Promise<boolean> => {
+        if (!transportRecovered) throw new Error('transport unavailable');
+        return true;
+      },
+    });
+    expect(await restarted.reserve(writer)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    expect(await restarted.hasReservation(reservation.taskId, reservation.requestDigest)).toBe(true);
+    transportRecovered = true;
+    expect(await restarted.reserve(writer)).toMatchObject({ ok: true });
+    expect(await restarted.hasReservation(reservation.taskId, reservation.requestDigest)).toBe(false);
   });
 
   it('keeps index diagnostics available while another reservation waits for native/task observation', async () => {
@@ -316,6 +452,8 @@ describe('DurableShellTaskIndex', () => {
     await mkdir(path.join(root, 'history-terminal'));
     await mkdir(path.join(root, 'history-running'));
     await mkdir(path.join(root, 'history-unverified'));
+    await Promise.all(['history-terminal', 'history-running', 'history-unverified'].map((taskId) =>
+      writeFile(path.join(root, taskId, 'task.json'), JSON.stringify({ taskId, generation: 1 }))));
     const firstInspector = vi.fn(async (taskId: string) => taskId === 'history-terminal' ? 'terminal' as const : 'active' as const);
 
     const first = new DurableShellTaskIndex(root, {
@@ -349,6 +487,99 @@ describe('DurableShellTaskIndex', () => {
       'history-unverified',
     ]);
     await replacement.release('new-task', 'a'.repeat(64));
+  });
+
+  it('does not hold the index lock while cold-history native inspection is blocked', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-index-cold-proof-lock-'));
+    temporaryRoots.push(root);
+    await mkdir(path.join(root, 'old-task'));
+    await writeFile(path.join(root, 'old-task', 'task.json'), JSON.stringify({ taskId: 'old-task', generation: 1 }));
+    let entered!: () => void;
+    let resume!: () => void;
+    const started = new Promise<void>((resolve): void => { entered = resolve; });
+    const stalled = new Promise<void>((resolve): void => { resume = resolve; });
+    const first = new DurableShellTaskIndex(root, {
+      maxConcurrentTasks: 4,
+      inspectTask: async (): Promise<'terminal'> => { entered(); await stalled; return 'terminal'; },
+    });
+    const pending = first.initialize();
+    await started;
+    try {
+      await expect(readFile(path.join(root, '.index', 'v1', 'index.lock'))).rejects.toMatchObject({ code: 'ENOENT' });
+      const concurrent = new DurableShellTaskIndex(root, { maxConcurrentTasks: 4, inspectTask: async () => 'unknown' as const });
+      expect(await concurrent.diagnostics().catch(durableTaskIndexDiagnosticError)).toMatchObject({
+        code: 'CONFLICT', details: { reason: 'DURABLE_TASK_INDEX_NOT_READY' },
+      });
+      expect(await readdir(path.join(root, '.index', 'v1', 'active'))).toEqual([]);
+    } finally {
+      resume();
+    }
+    await pending;
+    expect(await first.hasReservation('old-task', 'a'.repeat(64))).toBe(false);
+  });
+
+  it('holds cold-history tasks whose metadata changes or appears during terminal inspection', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-index-cold-proof-race-'));
+    temporaryRoots.push(root);
+    await mkdir(path.join(root, 'changing-task'));
+    await mkdir(path.join(root, 'appearing-task'));
+    const metadata = path.join(root, 'changing-task', 'task.json');
+    await writeFile(metadata, JSON.stringify({ generation: 1 }));
+    const original = await stat(metadata);
+    let entered!: () => void;
+    let resume!: () => void;
+    const started = new Promise<void>((resolve): void => { entered = resolve; });
+    const stalled = new Promise<void>((resolve): void => { resume = resolve; });
+    let observations = 0;
+    const inspectTask = vi.fn(async (): Promise<'terminal'> => {
+      observations += 1;
+      if (observations === 1) { entered(); await stalled; }
+      else await writeFile(metadata, JSON.stringify({ generation: 3 }));
+      return 'terminal';
+    });
+    const index = new DurableShellTaskIndex(root, { maxConcurrentTasks: 4, inspectTask });
+    const pending = index.initialize();
+    await started;
+    await writeFile(metadata, JSON.stringify({ generation: 2 }));
+    await utimes(metadata, original.atime, original.mtime);
+    await writeFile(path.join(root, 'appearing-task', 'task.json'), JSON.stringify({ generation: 1 }));
+    resume();
+    await pending;
+    expect((await index.diagnostics()).unresolved_reservations).toBe(2);
+    expect(await index.hasReservation('changing-task', 'a'.repeat(64))).toBe(true);
+    expect(await index.hasReservation('appearing-task', 'a'.repeat(64))).toBe(true);
+    expect(JSON.parse(await readFile(metadata, 'utf8'))).toEqual({ generation: 3 });
+    expect(inspectTask).toHaveBeenCalledTimes(2);
+  });
+
+  it('reobserves finalized bootstrap metadata before accepting its stable terminal proof', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-index-cold-finalization-'));
+    temporaryRoots.push(root);
+    await mkdir(path.join(root, 'finalizing-task'));
+    const metadata = path.join(root, 'finalizing-task', 'task.json');
+    await writeFile(metadata, JSON.stringify({ state: 'running', generation: 1 }));
+    const inspectTask = vi.fn(async (): Promise<'terminal'> => {
+      const current = JSON.parse(await readFile(metadata, 'utf8')) as { state: string };
+      if (current.state !== 'completed') await writeFile(metadata, JSON.stringify({ state: 'completed', generation: 1 }));
+      return 'terminal';
+    });
+    const index = new DurableShellTaskIndex(root, { maxConcurrentTasks: 4, inspectTask });
+    await index.initialize();
+    expect(inspectTask).toHaveBeenCalledTimes(2);
+    expect((await index.diagnostics()).unresolved_reservations).toBe(0);
+  });
+
+  it('holds missing and oversized bootstrap metadata without treating absence as terminal proof', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-index-cold-metadata-unknown-'));
+    temporaryRoots.push(root);
+    await mkdir(path.join(root, 'missing-metadata'));
+    await mkdir(path.join(root, 'oversized-metadata'));
+    await writeFile(path.join(root, 'oversized-metadata', 'task.json'), Buffer.alloc(1024 * 1024 + 1, 'x'));
+    const inspectTask = vi.fn(async () => 'terminal' as const);
+    const index = new DurableShellTaskIndex(root, { maxConcurrentTasks: 4, inspectTask });
+    await index.initialize();
+    expect(inspectTask).not.toHaveBeenCalled();
+    expect((await index.diagnostics()).unresolved_reservations).toBe(2);
   });
 
   it('retries transient lock-file deletion before another store instance acquires the index', async () => {
@@ -527,6 +758,9 @@ describe('DurableShellTaskIndex', () => {
     const active = path.join(root, '.index', 'v1', 'active');
     const markerPath = path.join(active, `${createHash('sha256').update(taskId).digest('hex')}.json`);
     await mkdir(active, { recursive: true });
+    await writeFile(path.join(root, '.index', 'v1', 'ready.json'), JSON.stringify({
+      version: 1, markerFormatVersion: 2, readyAt: new Date(0).toISOString(),
+    }));
     await writeFile(markerPath, JSON.stringify({
       version: 2,
       taskId,

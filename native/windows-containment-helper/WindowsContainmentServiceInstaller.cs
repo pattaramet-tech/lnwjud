@@ -169,20 +169,16 @@ internal static class WindowsContainmentServiceInstaller
         var installRoot = ValidateImagePath(imagePath, programFiles);
         EnsureNoReparsePoints(imagePath);
         VerifyProtectedAncestors(installRoot, programFiles);
-        SecureInstalledImage(installRoot, imagePath);
         VerifyPackageManifest(imagePath);
 
         using var manager = OpenSCManager(null, null, ScManagerConnect | ScManagerCreateService);
         if (manager.IsInvalid) throw new IOException("SERVICE_INSTALL_SCM_UNAVAILABLE");
-
-        var service = OpenService(manager, WindowsContainmentService.ServiceName, ServiceAllAccess);
-        var created = false;
-        if (service.IsInvalid)
+        RunFreshInstall(() => ObserveService(manager), () =>
         {
-            var error = Marshal.GetLastWin32Error();
-            service.Dispose();
-            if (error != ErrorServiceDoesNotExist) throw new IOException("SERVICE_INSTALL_OPEN_FAILED");
-            service = CreateService(
+            // Existing/unknown SCM identity is rejected before changing package ACLs.
+            SecureInstalledImage(installRoot, imagePath);
+            VerifyPackageManifest(imagePath);
+            using var service = CreateService(
                 manager,
                 WindowsContainmentService.ServiceName,
                 "lnwjud Windows Containment",
@@ -194,46 +190,27 @@ internal static class WindowsContainmentServiceInstaller
                 null,
                 0,
                 null,
-                null,
+                "LocalSystem",
                 null);
+            // A concurrent creator must never be reopened or treated as our service.
             if (service.IsInvalid) throw new IOException("SERVICE_INSTALL_CREATE_FAILED");
-            created = true;
-        }
-
-        using (service)
-        {
             try
             {
                 var installedImage = QueryImagePath(service);
                 if (!String.Equals(installedImage, imagePath, StringComparison.OrdinalIgnoreCase))
                     throw new IOException("SERVICE_INSTALL_EXISTING_IMAGE_MISMATCH");
-                StopAndWait(service);
-                if (!ChangeServiceConfig(
-                        service,
-                        ServiceWin32OwnProcess,
-                        ServiceAutoStart,
-                        ServiceErrorNormal,
-                        BuildServiceCommand(imagePath),
-                        null,
-                        0,
-                        null,
-                        "LocalSystem",
-                        null,
-                        "lnwjud Windows Containment"))
-                    throw new IOException("SERVICE_INSTALL_CONFIGURE_FAILED");
                 ApplyServiceSecurity(service);
                 StartAndWait(service);
             }
             catch
             {
-                if (created)
-                {
-                    try { StopAndWait(service); } catch { }
-                    _ = DeleteService(service);
-                }
+                // Cleanup is only for the handle returned by our successful CreateService.
+                // Failures still propagate; best-effort cleanup is not reported as rollback.
+                try { StopAndWait(service); } catch { }
+                _ = DeleteService(service);
                 throw;
             }
-        }
+        });
     }
 
     internal static void Uninstall()
@@ -241,23 +218,61 @@ internal static class WindowsContainmentServiceInstaller
         EnsureWindows();
         using var manager = OpenSCManager(null, null, ScManagerConnect);
         if (manager.IsInvalid) throw new IOException("SERVICE_REMOVE_SCM_UNAVAILABLE");
-        var service = OpenService(manager, WindowsContainmentService.ServiceName, ServiceAllAccess);
-        if (service.IsInvalid)
+        var clock = Stopwatch.StartNew();
+        RemoveAndConfirm(() =>
         {
-            var error = Marshal.GetLastWin32Error();
-            service.Dispose();
-            if (error == ErrorServiceDoesNotExist) return;
-            throw new IOException("SERVICE_REMOVE_OPEN_FAILED");
-        }
-
-        using (service)
-        {
-            StopAndWait(service);
-            if (!DeleteService(service))
+            var service = OpenService(manager, WindowsContainmentService.ServiceName, ServiceAllAccess);
+            if (service.IsInvalid)
             {
                 var error = Marshal.GetLastWin32Error();
-                if (error != ErrorServiceMarkedForDelete) throw new IOException("SERVICE_REMOVE_DELETE_FAILED");
+                service.Dispose();
+                if (error is ErrorServiceDoesNotExist or ErrorServiceMarkedForDelete) return;
+                throw new IOException("SERVICE_REMOVE_OPEN_FAILED");
             }
+            using (service)
+            {
+                StopAndWait(service);
+                if (!DeleteService(service) && Marshal.GetLastWin32Error() != ErrorServiceMarkedForDelete)
+                    throw new IOException("SERVICE_REMOVE_DELETE_FAILED");
+            }
+        }, () => ObserveService(manager), () => clock.Elapsed, () => Thread.Sleep(100));
+    }
+
+    private static int ObserveService(SafeServiceHandle manager)
+    {
+        using var observed = OpenService(manager, WindowsContainmentService.ServiceName, 0x0004);
+        return observed.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+    }
+
+    // Inject observations at the same production boundaries so tests never touch SCM.
+    internal static void RunFreshInstall(Func<int> observe, Action installFresh)
+    {
+        var observation = observe();
+        if (observation == 0)
+            throw new IOException("SERVICE_INSTALL_EXISTING_SERVICE_UPDATE_UNSUPPORTED");
+        if (observation != ErrorServiceDoesNotExist)
+            throw new IOException("SERVICE_INSTALL_OPEN_FAILED");
+        installFresh();
+    }
+
+    internal static void RemoveAndConfirm(Action removeAndClose, Func<int> observe,
+        Func<TimeSpan> elapsed, Action wait)
+    {
+        removeAndClose();
+        var started = elapsed();
+        var previous = started;
+        while (true)
+        {
+            var now = elapsed();
+            if (now < previous) throw new IOException("SERVICE_REMOVE_CONFIRMATION_UNAVAILABLE");
+            if (now - started >= TimeSpan.FromSeconds(30))
+                throw new IOException("SERVICE_REMOVE_DELETION_TIMEOUT");
+            var observation = observe();
+            if (observation == ErrorServiceDoesNotExist) return;
+            if (observation is not (0 or ErrorServiceMarkedForDelete))
+                throw new IOException("SERVICE_REMOVE_CONFIRMATION_UNAVAILABLE");
+            previous = now;
+            wait();
         }
     }
 

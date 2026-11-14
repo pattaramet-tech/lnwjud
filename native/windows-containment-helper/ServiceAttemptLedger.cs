@@ -131,6 +131,12 @@ internal sealed class ServiceAttemptLedger
         if (recovered) Persist();
     }
 
+    // Readiness must not prepare, inspect, release or persist any attempt.
+    internal void CheckAvailability()
+    {
+        lock (gate) EnsureAvailable();
+    }
+
     internal ServiceAttemptObservation Prepare(ServiceAttemptRequest request)
     {
         Validate(request);

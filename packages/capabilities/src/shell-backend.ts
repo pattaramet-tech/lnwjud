@@ -18,6 +18,7 @@ import { engineeringCommandFingerprint, formatEngineeringCommand } from '@lnwjud
 import type { CapabilityBackend } from './local-capability-service.js';
 import { prohibitedAgentCommandReason, riskyAgentCommandReason } from './agent-command-policy.js';
 import { DurableShellTaskStore } from './durable-shell-task-store.js';
+import { durableTaskIndexDiagnosticError } from './durable-shell-task-index.js';
 import { capabilityTaskOwnerCanInspect, capabilityTaskOwnerCanRecover, legacyCapabilityTaskOwner, readCapabilityActiveWorkspaceRoot, readCapabilityTaskOwner, type CapabilityTaskOwner } from './task-ownership.js';
 
 type ShellOperation = 'run' | 'list' | 'status' | 'wait' | 'logs' | 'result' | 'cancel' | 'resume' | 'approve' | 'deny';
@@ -570,7 +571,7 @@ export class ShellCapabilityBackend implements CapabilityBackend {
   private async listTasks(owner: CapabilityTaskOwner, limit?: number, cursor?: string): Promise<Result<unknown>> {
     let admission;
     try { admission = this.durableStore === undefined ? {} : { admission: await this.durableStore.admissionDiagnostics() }; }
-    catch { return err(appError('INTERNAL_ERROR', 'Writer admission diagnostics are unavailable; no empty-capacity conclusion can be made', true)); }
+    catch (error: unknown) { return err(durableTaskIndexDiagnosticError(error)); }
     const inMemory = [...this.tasks.values()]
       .filter((record) => capabilityTaskOwnerCanInspect(record.owner, owner))
       .map((record) => this.snapshot(record));
@@ -584,7 +585,7 @@ export class ShellCapabilityBackend implements CapabilityBackend {
         if (cursor !== undefined && memoryOffset.value === undefined) return err(appError('INVALID_INPUT', 'Task list cursor is invalid'));
         return ok(memoryTaskPage(inMemory, limit, 0));
       }
-      const durable = await this.durableStore.listPage(owner, limit, cursor);
+      const durable = await this.durableStore.listPage(owner, limit, cursor, true);
       if (!durable.ok) return durable;
       const durableIds = new Set(durable.value.tasks.map((task) => task.task_id).filter((value): value is string => typeof value === 'string'));
       const remainingMemory = inMemory.filter((task) => !durableIds.has(String(task.task_id ?? '')));
@@ -601,7 +602,7 @@ export class ShellCapabilityBackend implements CapabilityBackend {
       });
     }
     if (this.durableStore === undefined) return ok({ tasks: inMemory });
-    const durable = await this.durableStore.list(owner);
+    const durable = await this.durableStore.list(owner, true);
     const durableIds = new Set(durable.map((task) => task.task_id).filter((value): value is string => typeof value === 'string'));
     return ok({ tasks: [...durable, ...inMemory.filter((task) => !durableIds.has(String(task.task_id ?? '')))], ...admission });
   }

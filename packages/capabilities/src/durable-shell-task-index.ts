@@ -109,7 +109,8 @@ export class DurableShellTaskIndex {
 
   public async initialize(): Promise<void> {
     await this.ensureDirectories();
-    await this.withLock(async () => this.initializeUnlocked());
+    const terminalHistory = await this.observeBootstrapHistoryOutsideLock();
+    await this.withLock(async () => this.initializeUnlocked(terminalHistory));
   }
 
   public async reserve(input: DurableTaskReservation): Promise<Result<DurableTaskReservationResult>> {
@@ -129,7 +130,8 @@ export class DurableShellTaskIndex {
       // Native RPCs may time out; never await them under the shared index lock.
       const ready = await readJson(this.readyPath);
       if (!isReady(ready) || ready.markerFormatVersion !== 2) {
-        await this.withLock(async () => this.initializeUnlocked());
+        const terminalHistory = await this.observeBootstrapHistoryOutsideLock();
+        await this.withLock(async () => this.initializeUnlocked(terminalHistory));
       }
       const observations = await this.observeMarkersOutsideLock(input.taskId);
       return await this.withLock(async () => {
@@ -220,9 +222,8 @@ export class DurableShellTaskIndex {
         return ok({ activeTasks: activeTasks + 1, created: true, markerPath });
       });
     } catch (error: unknown) {
-      const message = error instanceof Error && error.message === 'Durable task index lock is busy'
-        ? 'Durable task index lock is busy' : 'Durable task capacity could not be reserved';
-      return err(appError('INTERNAL_ERROR', message, true));
+      if (error instanceof IndexLockBusyError) return err(indexLockContentionError());
+      return err(appError('INTERNAL_ERROR', 'Durable task capacity could not be reserved', true));
     }
   }
 
@@ -254,7 +255,8 @@ export class DurableShellTaskIndex {
   public async diagnostics(): Promise<WriterAdmissionDiagnostics> {
     await this.ensureDirectories();
     return this.withLock(async () => {
-      await this.initializeUnlocked();
+      // Diagnosis must not bootstrap, migrate, reconcile or reclaim reservations.
+      await this.requireDiagnosticReadyUnlocked();
       const markers = await this.readMarkers();
       let durable = 0;
       let managed = 0;
@@ -321,24 +323,32 @@ export class DurableShellTaskIndex {
     readonly limit: number;
     readonly cursor?: string;
     readonly accept?: (record: DurableTaskLaunchRecord) => boolean;
+    readonly readOnly?: boolean;
   }): Promise<Result<DurableTaskLaunchPage>> {
     if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > MAX_PAGE_SIZE) {
       return err(appError('INVALID_INPUT', `Durable task list limit must be between 1 and ${MAX_PAGE_SIZE}`));
     }
     try {
       await this.ensureDirectories();
+      const terminalHistory = options.readOnly ? new Map<string, string>() : await this.observeBootstrapHistoryOutsideLock();
       return await this.withLock(async () => {
-        await this.initializeUnlocked();
-        await this.ensureJournalUnlocked();
+        if (options.readOnly) await this.requireDiagnosticReadyUnlocked();
+        else {
+          await this.initializeUnlocked(terminalHistory);
+          await this.ensureJournalUnlocked();
+        }
         try {
           return ok(await this.readLaunchPage(options));
         } catch (error: unknown) {
-          if (error instanceof CorruptJournalError) await this.rebuildJournalUnlocked();
+          if (options.readOnly && isRecord(error) && error.code === 'ENOENT') throw new IndexNotReadyError();
+          if (error instanceof CorruptJournalError && !options.readOnly) await this.rebuildJournalUnlocked();
           throw error;
         }
       });
     } catch (error: unknown) {
       if (error instanceof InvalidCursorError) return err(appError('INVALID_INPUT', error.message));
+      if (error instanceof IndexLockBusyError) return err(indexLockContentionError());
+      if (error instanceof IndexNotReadyError) return err(durableTaskIndexDiagnosticError(error));
       if (error instanceof CorruptJournalError) {
         return err(appError('INTERNAL_ERROR', 'Durable task launch journal is corrupt; retry after rebuild', true));
       }
@@ -349,6 +359,11 @@ export class DurableShellTaskIndex {
   private async ensureDirectories(): Promise<void> {
     await mkdir(this.rootDirectory, { recursive: true });
     await mkdir(this.activeDirectory, { recursive: true });
+  }
+
+  private async requireDiagnosticReadyUnlocked(): Promise<void> {
+    const ready = await readJson(this.readyPath);
+    if (!isReady(ready) || ready.markerFormatVersion !== 2) throw new IndexNotReadyError();
   }
 
   private async observeMarkersOutsideLock(excludedTaskId: string): Promise<Map<string, {
@@ -369,7 +384,9 @@ export class DurableShellTaskIndex {
         if (record === undefined || record.taskId === excludedTaskId) return;
         const needsNativeProof = record.mutationKind === 'opaque_contained_process' || record.nativeBinding !== undefined;
         const nativeTerminated = needsNativeProof ? await this.hasVerifiedNativeTermination(record) : false;
-        const inspection = record.mutationKind === 'opaque_contained_process' ? 'unknown' as const
+        // A terminal task projection cannot substitute for independent native
+        // evidence, including native-bound durable-shell reservations.
+        const inspection = needsNativeProof ? 'unknown' as const
           : await this.options.inspectTask(record.taskId).catch(() => 'unknown' as const);
         observations.set(marker.path, { record, nativeTerminated, inspection });
       }));
@@ -396,7 +413,67 @@ export class DurableShellTaskIndex {
     }
   }
 
-  private async initializeUnlocked(): Promise<void> {
+  private async observeBootstrapHistoryOutsideLock(): Promise<ReadonlyMap<string, string>> {
+    const observations = new Map<string, string>();
+    if (isReady(await readJson(this.readyPath))) return observations;
+    const entries = (await readdir(this.rootDirectory, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && entry.name !== '.index' && isSafeTaskId(entry.name));
+    // Reconciliation may call a native service. Cold-index bootstrap follows
+    // the same bounded outside-lock proof rule as warm reservation admission.
+    for (let offset = 0; offset < entries.length; offset += 4) {
+      await Promise.all(entries.slice(offset, offset + 4).map(async (entry) => {
+        try { await lstat(this.markerPath(entry.name)); return; }
+        catch (error: unknown) { if (!isRecord(error) || error.code !== 'ENOENT') return; }
+        let before = await this.bootstrapTaskSnapshot(entry.name);
+        for (let attempt = 0; attempt < 2 && before !== undefined; attempt += 1) {
+          const inspection = await this.options.inspectTask(entry.name).catch(() => 'unknown' as const);
+          if (inspection !== 'terminal') return;
+          const after = await this.bootstrapTaskSnapshot(entry.name);
+          if (after === before) { observations.set(entry.name, before); return; }
+          // Reconciliation may have just persisted terminal metadata. Obtain a
+          // fresh independent observation of that exact identity once, outside
+          // the lock; continual changes retain a conservative legacy marker.
+          before = after;
+        }
+      }));
+    }
+    return observations;
+  }
+
+  private async bootstrapTaskSnapshot(taskId: string): Promise<string | undefined> {
+    const directory = path.join(this.rootDirectory, taskId);
+    const filename = path.join(directory, 'task.json');
+    try {
+      const directoryBefore = await lstat(directory);
+      if (!directoryBefore.isDirectory() || directoryBefore.isSymbolicLink()) return undefined;
+      const pathnameBefore = await lstat(filename);
+      if (!pathnameBefore.isFile() || pathnameBefore.isSymbolicLink()
+        || pathnameBefore.size > MAX_BOOTSTRAP_METADATA_BYTES) return undefined;
+      const handle = await open(filename, 'r');
+      try {
+        const before = await handle.stat();
+        if (!before.isFile() || before.size > MAX_BOOTSTRAP_METADATA_BYTES
+          || fileIdentity(before) !== fileIdentity(pathnameBefore)) return undefined;
+        const contents = Buffer.alloc(before.size + 1);
+        const { bytesRead } = await handle.read(contents, 0, contents.length, 0);
+        if (bytesRead !== before.size || fileIdentity(await handle.stat()) !== fileIdentity(before)) return undefined;
+        const pathnameAfter = await lstat(filename);
+        const directoryAfter = await lstat(directory);
+        if (pathnameAfter.isSymbolicLink() || fileIdentity(pathnameAfter) !== fileIdentity(before)
+          || fileIdentity(directoryAfter) !== fileIdentity(directoryBefore)) return undefined;
+        return JSON.stringify([
+          fileIdentity(directoryBefore), fileIdentity(before), createHash('sha256').update(contents.subarray(0, bytesRead)).digest('hex'),
+        ]);
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      // Missing, unreadable, oversized or changing metadata is not terminal evidence.
+      return undefined;
+    }
+  }
+
+  private async initializeUnlocked(terminalHistory: ReadonlyMap<string, string> = new Map()): Promise<void> {
     const ready = await readJson(this.readyPath);
     if (isReady(ready)) {
       if (ready.markerFormatVersion === 2) {
@@ -412,13 +489,13 @@ export class DurableShellTaskIndex {
     await this.upgradeLegacyMarkersUnlocked();
     const entries = await readdir(this.rootDirectory, { withFileTypes: true });
     for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name === '.index') continue;
-      const inspection = await this.options.inspectTask(entry.name).catch(() => 'unknown' as const);
-      if (inspection !== 'active' && inspection !== 'unknown') continue;
+      if (!entry.isDirectory() || entry.name === '.index' || !isSafeTaskId(entry.name)) continue;
       const markerPath = this.markerPath(entry.name);
       try { await lstat(markerPath); continue; } catch (error: unknown) {
         if (typeof error === 'object' && error !== null && 'code' in error && error.code !== 'ENOENT') continue;
       }
+      const observedTerminal = terminalHistory.get(entry.name);
+      if (observedTerminal !== undefined && await this.bootstrapTaskSnapshot(entry.name) === observedTerminal) continue;
       await atomicWriteJson(markerPath, {
         version: 2,
         taskId: entry.name,
@@ -440,7 +517,8 @@ export class DurableShellTaskIndex {
   private async reclaimTerminatedSynchronousMutationsUnlocked(): Promise<void> {
     for (const marker of await this.readMarkers()) {
       const record = marker.record;
-      if (record === undefined || record.legacy === true || record.mutationKind !== 'synchronous_mutation' || record.launcherPid === undefined) continue;
+      if (record === undefined || record.legacy === true || record.nativeBinding !== undefined
+        || record.mutationKind !== 'synchronous_mutation' || record.launcherPid === undefined) continue;
       let ownerGone = false;
       try { ownerGone = this.processProvenGone(record.launcherPid); } catch { /* Unknown liveness retains the blocker. */ }
       if (ownerGone) await this.removeMarker(marker.path);
@@ -572,7 +650,7 @@ export class DurableShellTaskIndex {
       } catch (error: unknown) {
         if (!isAlreadyExists(error)) throw error;
         await this.reclaimStaleLock();
-        if (Date.now() >= deadline) throw new Error('Durable task index lock is busy');
+        if (Date.now() >= deadline) throw new IndexLockBusyError('Durable task index lock is busy');
         await delay(LOCK_RETRY_MS);
       }
     }
@@ -634,13 +712,37 @@ const LOCK_STALE_MS = 30_000;
 const MAX_PAGE_SIZE = 200;
 const JOURNAL_READ_CHUNK_BYTES = 64 * 1024;
 const MAX_JOURNAL_LINE_BYTES = 16 * 1024;
+const MAX_BOOTSTRAP_METADATA_BYTES = 1024 * 1024;
 const CURSOR_PREFIX = 'lnwjud-durable-shell-v1:';
 
 class InvalidCursorError extends Error {}
 class CorruptJournalError extends Error {}
+class IndexLockBusyError extends Error {}
+class IndexNotReadyError extends Error {}
+
+/** Preserve only trusted index failures; never classify arbitrary exception text. */
+export function durableTaskIndexDiagnosticError(error: unknown): ReturnType<typeof appError> {
+  if (error instanceof IndexLockBusyError) return indexLockContentionError();
+  if (error instanceof IndexNotReadyError) return {
+    ...appError('CONFLICT', 'Durable task index is not ready; retry after normal task initialization completes', true),
+    details: { reason: 'DURABLE_TASK_INDEX_NOT_READY' },
+  };
+  return appError('INTERNAL_ERROR', 'Writer admission diagnostics are unavailable; no empty-capacity conclusion can be made', true);
+}
+
+function indexLockContentionError(): ReturnType<typeof appError> {
+  return {
+    ...appError('CONFLICT', 'Durable task index lock is busy; retry the same request after the current operation finishes', true),
+    details: { reason: 'DURABLE_TASK_INDEX_LOCK_BUSY', retry_after_ms: LOCK_RETRY_MS },
+  };
+}
 
 function normalizeMaximum(value: number): number {
   return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
+}
+
+function fileIdentity(value: { readonly dev: number; readonly ino: number; readonly mode: number; readonly size: number; readonly birthtimeMs: number; readonly ctimeMs: number; readonly mtimeMs: number }): string {
+  return [value.dev, value.ino, value.mode, value.size, value.birthtimeMs, value.ctimeMs, value.mtimeMs].join(':');
 }
 
 function isSafeTaskId(value: string): boolean {

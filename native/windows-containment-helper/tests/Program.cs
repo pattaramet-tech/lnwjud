@@ -5,6 +5,7 @@ using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 
 namespace Lnwjud.Containment;
 
@@ -18,12 +19,122 @@ internal static class NativeTests
     private static readonly string Executable = Environment.ProcessPath ?? throw new Exception("No test executable");
     private static readonly Dictionary<string, string> EnvironmentBlock = Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>().ToDictionary(entry => (string)entry.Key, entry => (string)(entry.Value ?? ""));
 
+    [DllImport("kernel32.dll", EntryPoint = "OpenProcess", SetLastError = true)]
+    private static extern SafeProcessHandle OpenEndpointTestProcess(uint access, bool inherit, uint pid);
+
+    private static Process StartEndpointTestChild(int exitCode)
+    {
+        var start = new ProcessStartInfo(Executable)
+        {
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardInput = true, RedirectStandardOutput = true,
+        };
+        start.ArgumentList.Add("endpoint-liveness-child");
+        start.ArgumentList.Add(exitCode.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var child = Process.Start(start) ?? throw new Exception("Endpoint child fixture unavailable");
+        try
+        {
+            var ready = child.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10)).GetAwaiter().GetResult();
+            if (ready != "ENDPOINT_CHILD_READY") throw new Exception("Endpoint child fixture did not become ready");
+            return child;
+        }
+        catch (Exception startupFailure)
+        {
+            try { FinishEndpointTestChild(child); }
+            catch (Exception cleanupFailure) { throw new AggregateException("Endpoint child startup and cleanup failed", startupFailure, cleanupFailure); }
+            finally { child.Dispose(); }
+            throw;
+        }
+    }
+
+    private static void FinishEndpointTestChild(Process child)
+    {
+        if (!child.HasExited)
+        {
+            child.StandardInput.Close(); // EOF gracefully ends only this owned fixture.
+        }
+        if (!child.WaitForExit(10_000)) throw new Exception("Endpoint child fixture did not exit within its bound");
+    }
+
+    private static SafeProcessHandle PinEndpointTestChild(Process child, uint access = ServiceEndpointIdentity.QueryLimitedInformation)
+    {
+        var handle = OpenEndpointTestProcess(access, false, checked((uint)child.Id));
+        if (handle.IsInvalid) { handle.Dispose(); throw new Exception("Endpoint fixture process handle unavailable"); }
+        return handle;
+    }
+
+    private static void TestEndpointProcessLiveness()
+    {
+        foreach (var exitCode in new[] { 0, 259, 37 })
+        {
+            using var child = StartEndpointTestChild(exitCode);
+            try
+            {
+                using var pinned = PinEndpointTestChild(child);
+                if (!ServiceEndpointIdentity.ProcessStillRunning(pinned)) throw new Exception("Live endpoint child misclassified");
+                FinishEndpointTestChild(child);
+                if (child.ExitCode != exitCode) throw new Exception("Endpoint child did not return its requested exit code");
+                if (ServiceEndpointIdentity.ProcessStillRunning(pinned)) throw new Exception("Terminated endpoint exit code " + exitCode + " misclassified as running");
+                Console.WriteLine("PASS live child then terminated exit " + exitCode);
+            }
+            finally { FinishEndpointTestChild(child); }
+        }
+
+        using var live = StartEndpointTestChild(0);
+        try
+        {
+            using var invalid = new SafeProcessHandle(0, ownsHandle: false);
+            if (ServiceEndpointIdentity.ProcessStillRunning(invalid)) throw new Exception("Invalid endpoint handle accepted");
+            using var closed = PinEndpointTestChild(live);
+            closed.Dispose();
+            if (ServiceEndpointIdentity.ProcessStillRunning(closed)) throw new Exception("Closed endpoint handle accepted");
+            // A valid test-owned event is not a process. Its query must fail in
+            // GetProcessTimes, rather than relying on OpenProcess(0) policy.
+            using var queryFailureEvent = new EventWaitHandle(false, EventResetMode.ManualReset);
+            using var nonProcess = new SafeProcessHandle(queryFailureEvent.SafeWaitHandle.DangerousGetHandle(), ownsHandle: false);
+            if (ServiceEndpointIdentity.ProcessStillRunning(nonProcess)) throw new Exception("Endpoint query failure accepted");
+            GC.KeepAlive(queryFailureEvent);
+            Console.WriteLine("PASS invalid, closed and failing-query handles fail closed");
+        }
+        finally { FinishEndpointTestChild(live); }
+
+        using var oldChild = StartEndpointTestChild(259);
+        try
+        {
+            using var oldPin = PinEndpointTestChild(oldChild);
+            FinishEndpointTestChild(oldChild);
+            using var replacement = StartEndpointTestChild(0);
+            try
+            {
+                using var replacementPin = PinEndpointTestChild(replacement);
+                var previousPid = checked((uint)oldChild.Id);
+                var replacementPid = checked((uint)replacement.Id);
+                if (previousPid == replacementPid) throw new Exception("Distinct retained process fixtures unexpectedly share a PID");
+                ServiceEndpointIdentity.ValidateServiceBinding(previousPid, previousPid, 4, 0x10);
+                ExpectFailure<IOException>(() => ServiceEndpointIdentity.ValidateServiceBinding(previousPid, replacementPid, 4, 0x10), "SERVICE_ENDPOINT_PID_MISMATCH");
+                ExpectFailure<IOException>(() => ServiceEndpointIdentity.ValidateServiceBinding(previousPid, previousPid, 1, 0x10), "SERVICE_ENDPOINT_PID_MISMATCH");
+                ExpectFailure<IOException>(() => ServiceEndpointIdentity.ValidateServiceBinding(previousPid, previousPid, 4, 0x20), "SERVICE_ENDPOINT_PID_MISMATCH");
+                if (ServiceEndpointIdentity.ProcessStillRunning(oldPin) || !ServiceEndpointIdentity.ProcessStillRunning(replacementPin))
+                    throw new Exception("Retained endpoint instance fence followed a replacement process");
+                Console.WriteLine("PASS changed PID, stopped service/type and retained dead-instance fences (PID reuse modeled)");
+            }
+            finally { FinishEndpointTestChild(replacement); }
+        }
+        finally { FinishEndpointTestChild(oldChild); }
+        Console.WriteLine("PASS endpoint liveness regression uses only owned children and query-limited process pins");
+    }
+
     private static int Main(string[] args)
     {
         if (args.Length > 0)
         {
             switch (args[0])
             {
+                case "endpoint-liveness-child":
+                    Console.WriteLine("ENDPOINT_CHILD_READY"); Console.Out.Flush();
+                    _ = Console.ReadLine();
+                    return int.Parse(args[1], System.Globalization.CultureInfo.InvariantCulture);
+                case "endpoint-exit259-tests": TestEndpointProcessLiveness(); return 0;
                 case "noop": return 0;
                 case "enrollment-ownership": EnrollmentAttestationTests.Ownership(); return 0;
                 case "enrollment-attestation": EnrollmentAttestationTests.Adapter(); return 0;
@@ -149,6 +260,12 @@ internal static class NativeTests
                         return 0;
                     }
                     finally { Console.WriteLine("NATIVE_IMPORT_SUITE_PROTECTED_EVIDENCE_RETAINED " + importRoot); }
+                case "lifecycle-root-proof-test":
+                    TestLifecycleRootProofFailure(apiFailure: false).GetAwaiter().GetResult();
+                    return 0;
+                case "lifecycle-tests":
+                    TestNativeLifecycleAsync().GetAwaiter().GetResult();
+                    return 0;
                 case "output-tests":
                     TestOutputWaitsForReservationRelease().GetAwaiter().GetResult();
                     TestCancellationWaitsForReservationRelease().GetAwaiter().GetResult();
@@ -177,7 +294,10 @@ internal static class NativeTests
                         Directory.Delete(absolute, true);
                     }
                 }
+                case "installer-deletion-tests": return RunInstallerSafetyTest(TestInstallerDeletion, "SCM deletion confirmation and fail-closed errors");
+                case "installer-existing-update-tests": return RunInstallerSafetyTest(TestInstallerExistingUpdate, "existing-service update rejected before mutation");
                 case "service-failure-reason-tests": TestServiceFailureReason(); Console.WriteLine("PASS safe service installer failure codes"); return 0;
+                case "readiness-rpc-tests": TestReadinessRpcAsync().GetAwaiter().GetResult(); Console.WriteLine("PASS authenticated readiness RPC is nonmutating and fails closed for unavailable ledger"); return 0;
                 case "service-restart-tests":
                     TestServiceRestartAndJobReconciliation();
                     Console.WriteLine("PASS isolated service restart reconciliation");
@@ -232,6 +352,7 @@ internal static class NativeTests
             TestServiceInstallPathValidation();
             Console.WriteLine("PASS protected service install layout and command quoting");
             TestServiceEndpointImagePolicy(root);
+            TestEndpointProcessLiveness();
             Console.WriteLine("PASS protected service image may differ from the portable client and rejects hash or account mismatch");
             TestJobCollision();
             TestUnknownCancelCollision();
@@ -388,6 +509,89 @@ internal static class NativeTests
             || stdout.Result != "{\"protocol\":3,\"ok\":false,\"error\":\"SERVICE_ENDPOINT_NOT_INSTALLED\"}" + Environment.NewLine
             || stderr.Result != "NATIVE_CONTAINMENT_UNRESOLVED" + Environment.NewLine)
             throw new Exception("Missing-service RPC did not return the bounded diagnostic");
+    }
+
+    private static int RunInstallerSafetyTest(Action test, string description)
+    {
+        try { test(); Console.WriteLine("PASS " + description); return 0; }
+        catch (Exception error) { Console.Error.WriteLine("FAIL " + error.Message); return 1; }
+    }
+
+    private static void InstallerExpectedFailure(Action action, string reason)
+    {
+        try { action(); }
+        catch (IOException error) when (error.Message == reason) { return; }
+        throw new Exception("INSTALLER_EXPECTED_FAILURE_" + reason);
+    }
+
+    private static void TestInstallerExistingUpdate()
+    {
+        foreach (var error in new[] { 0, 1072, 5, 6, 1062 })
+        {
+            var mutations = 0;
+            InstallerExpectedFailure(() => WindowsContainmentServiceInstaller.RunFreshInstall(
+                () => error, () => mutations++), error == 0
+                    ? "SERVICE_INSTALL_EXISTING_SERVICE_UPDATE_UNSUPPORTED" : "SERVICE_INSTALL_OPEN_FAILED");
+            if (mutations != 0) throw new Exception("EXISTING_SERVICE_MUTATED_BEFORE_REFUSAL");
+        }
+        var fresh = 0;
+        WindowsContainmentServiceInstaller.RunFreshInstall(() => 1060, () => fresh++);
+        if (fresh != 1) throw new Exception("FRESH_INSTALL_NOT_INVOKED_ON_PROVEN_ABSENCE");
+        InstallerExpectedFailure(() => WindowsContainmentServiceInstaller.RunFreshInstall(
+            () => 1060, () => throw new IOException("SERVICE_INSTALL_CREATE_FAILED")), "SERVICE_INSTALL_CREATE_FAILED");
+        InstallerExpectedFailure(() => WindowsContainmentServiceInstaller.RunFreshInstall(
+            () => throw new IOException("SERVICE_INSTALL_OPEN_FAILED"), () => fresh++), "SERVICE_INSTALL_OPEN_FAILED");
+        if (fresh != 1) throw new Exception("INSPECTION_FAILURE_ALLOWED_INSTALL");
+    }
+
+    private static void TestInstallerDeletion()
+    {
+        var open = true;
+        var observations = new Queue<int>(new[] { 0, 1072, 1060 });
+        var now = TimeSpan.Zero;
+        var polls = 0;
+        WindowsContainmentServiceInstaller.RemoveAndConfirm(() => open = false, () =>
+        {
+            if (open) throw new Exception("OWN_SERVICE_HANDLE_NOT_DISPOSED_BEFORE_CONFIRMATION");
+            polls++;
+            return observations.Dequeue();
+        }, () => now, () => now += TimeSpan.FromSeconds(1));
+        if (polls != 3 || observations.Count != 0) throw new Exception("DELETION_SUCCESS_WITHOUT_SCM_1060");
+
+        var waits = 0;
+        WindowsContainmentServiceInstaller.RemoveAndConfirm(() => { }, () => 1060,
+            () => TimeSpan.Zero, () => waits++);
+        if (waits != 0) throw new Exception("ABSENT_SERVICE_WAS_RETRIED");
+        foreach (var error in new[] { 5, 6, 1062, -1 })
+            InstallerExpectedFailure(() => WindowsContainmentServiceInstaller.RemoveAndConfirm(
+                () => { }, () => error, () => TimeSpan.Zero, () => throw new Exception("ERROR_WAS_RETRIED")),
+                "SERVICE_REMOVE_CONFIRMATION_UNAVAILABLE");
+        foreach (var pending in new[] { 0, 1072 })
+        {
+            now = TimeSpan.Zero;
+            InstallerExpectedFailure(() => WindowsContainmentServiceInstaller.RemoveAndConfirm(
+                () => { }, () => pending, () => now, () => now += TimeSpan.FromSeconds(10)),
+                "SERVICE_REMOVE_DELETION_TIMEOUT");
+        }
+        polls = 0;
+        InstallerExpectedFailure(() => WindowsContainmentServiceInstaller.RemoveAndConfirm(
+            () => throw new IOException("SERVICE_STOP_TIMEOUT"), () => { polls++; return 1060; },
+            () => TimeSpan.Zero, () => { }), "SERVICE_STOP_TIMEOUT");
+        if (polls != 0) throw new Exception("STOP_FAILURE_WAS_REPORTED_AS_SUCCESS");
+        InstallerExpectedFailure(() => WindowsContainmentServiceInstaller.RemoveAndConfirm(
+            () => throw new IOException("SERVICE_REMOVE_DELETE_FAILED"), () => { polls++; return 1060; },
+            () => TimeSpan.Zero, () => { }), "SERVICE_REMOVE_DELETE_FAILED");
+        if (polls != 0) throw new Exception("DELETE_FAILURE_WAS_REPORTED_AS_SUCCESS");
+        InstallerExpectedFailure(() => WindowsContainmentServiceInstaller.RemoveAndConfirm(
+            () => { }, () => throw new IOException("SERVICE_REMOVE_CONFIRMATION_UNAVAILABLE"),
+            () => TimeSpan.Zero, () => { }), "SERVICE_REMOVE_CONFIRMATION_UNAVAILABLE");
+        var clockReads = 0;
+        InstallerExpectedFailure(() => WindowsContainmentServiceInstaller.RemoveAndConfirm(
+            () => { }, () => 1060, () => clockReads++ == 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(-1),
+            () => { }), "SERVICE_REMOVE_CONFIRMATION_UNAVAILABLE");
+        now = TimeSpan.Zero;
+        WindowsContainmentServiceInstaller.RemoveAndConfirm(() => now += TimeSpan.FromMinutes(1),
+            () => 1060, () => now, () => { });
     }
 
     private static void TestServiceFailureReason()
@@ -1452,6 +1656,76 @@ internal static class NativeTests
         }
     }
 
+    private static async Task TestReadinessRpcAsync()
+    {
+        // This private test pipe never connects to SCM or the installed service,
+        // prepares a native process or launches a target/worker/helper.
+        var pipeName = "lnwjud-readiness-test-" + Guid.NewGuid().ToString("N");
+        var root = Path.Combine(Path.GetTempPath(), "lnwjud-readiness-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var storePath = Path.Combine(root, "attempts.json");
+        var ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(storePath));
+        var callerSid = WindowsIdentity.GetCurrent().User!.Value;
+        var held = NewServiceAttemptRequest("readiness-held-terminal", Path.Combine(root, "held")) with { AuthenticatedCallerSid = callerSid };
+        ledger.Prepare(held);
+        ledger.TryCommitDispatch(held.Identity, callerSid, held.OperationDigest);
+        ledger.RecordTerminal(held.Identity, callerSid, ServiceProcessOutcome.Completed, 0, 0);
+        var before = File.ReadAllBytes(storePath);
+        var heldBefore = ledger.Inspect(held.Identity, callerSid);
+        using var stopping = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var server = WindowsContainmentService.RunAuthenticatedTestPipeServerAsync(pipeName, ledger, stopping.Token);
+        try
+        {
+            for (var retry = 0; retry < 3; retry++)
+            {
+                using var response = await SendServiceRpcAsync(pipeName, JsonSerializer.SerializeToUtf8Bytes(new { protocol = 3, command = "check_readiness" }));
+                var envelope = response.RootElement;
+                if (envelope.GetProperty("protocol").GetInt32() != 3 || !envelope.GetProperty("ok").GetBoolean())
+                    throw new Exception("Readiness did not return the authenticated success contract");
+                var result = envelope.GetProperty("result");
+                if (result.EnumerateObject().Count() != 2 || result.GetProperty("protocol").GetInt32() != 3
+                    || result.GetProperty("state").GetString() != "ready")
+                    throw new Exception("Readiness response was not the strict protocol-3 ready contract");
+            }
+            if (!before.AsSpan().SequenceEqual(File.ReadAllBytes(storePath)) || ledger.Inspect(held.Identity, callerSid) != heldBefore)
+                throw new Exception("Readiness changed a held attempt or its persisted bytes");
+
+            using (var wrongProtocol = await SendServiceRpcAsync(pipeName, JsonSerializer.SerializeToUtf8Bytes(new { protocol = 2, command = "check_readiness" })))
+            {
+                if (wrongProtocol.RootElement.GetProperty("ok").GetBoolean()
+                    || wrongProtocol.RootElement.GetProperty("error").GetString() != "SERVICE_PROTOCOL_INVALID")
+                    throw new Exception("Readiness accepted the wrong protocol");
+            }
+            using (var suppliedOwner = await SendServiceRpcAsync(pipeName, JsonSerializer.SerializeToUtf8Bytes(new { protocol = 3, command = "check_readiness", authenticatedCallerSid = "S-1-5-18" })))
+            {
+                if (suppliedOwner.RootElement.GetProperty("ok").GetBoolean())
+                    throw new Exception("Readiness accepted caller-supplied authentication identity");
+            }
+
+            // Induce persistence failure only within this test's temp directory.
+            // The ledger then remains unavailable and readiness must refuse it.
+            File.Delete(storePath);
+            Directory.CreateDirectory(storePath);
+            var failed = NewServiceAttemptRequest("readiness-persistence-failure", Path.Combine(root, "other")) with { AuthenticatedCallerSid = callerSid };
+            ExpectFailure<IOException>(() => ledger.Prepare(failed), "ATTEMPT_STORE_UNAVAILABLE");
+            using var unavailable = await SendServiceRpcAsync(pipeName, JsonSerializer.SerializeToUtf8Bytes(new { protocol = 3, command = "check_readiness" }));
+            if (unavailable.RootElement.GetProperty("ok").GetBoolean()
+                || unavailable.RootElement.GetProperty("error").GetString() != "ATTEMPT_STORE_UNAVAILABLE")
+                throw new Exception("Unavailable ledger was reported ready");
+        }
+        finally
+        {
+            stopping.Cancel();
+            await server.WaitAsync(TimeSpan.FromSeconds(5));
+            var absolute = Path.GetFullPath(root);
+            var temporary = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            if (!absolute.StartsWith(temporary, StringComparison.OrdinalIgnoreCase)
+                || !Path.GetFileName(absolute).StartsWith("lnwjud-readiness-test-", StringComparison.Ordinal))
+                throw new Exception("Refusing readiness test cleanup outside its temporary root");
+            Directory.Delete(absolute, true);
+        }
+    }
+
     private static void TestServiceRpcIdentityAndReservationsAsync() =>
         TestServiceRpcIdentityAndReservationsCoreAsync().GetAwaiter().GetResult();
 
@@ -1998,41 +2272,369 @@ internal static class NativeTests
         finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
     }
 
-    private static async Task TestOutputReaderFailure()
+    // These hooks exercise the actual Run/Monitor/Stop path with private owned
+    // children; the Job/root overrides model an independently delayed proof.
+    private sealed class LifecycleFixture
     {
-        var directory = Path.Combine(Path.GetTempPath(), "lnwjud-output-reader-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(directory);
-        WindowsServiceProcessRuntime? runtime = null;
+        internal readonly string DirectoryPath;
+        internal readonly string Sid = WindowsIdentity.GetCurrent().User!.Value;
+        internal readonly ServiceAttemptRequest Request;
+        internal readonly ServiceAttemptLedger Ledger;
+        internal readonly WindowsServiceProcessRuntime Runtime;
+        internal Process? Child;
+        internal SafePipeHandle? StdoutHandle, StderrHandle;
+        internal Action<string, uint>? Hook;
+        internal Action? BeforeCleanup;
+        internal Action? AfterCleanup;
+        internal bool ExpectedStopFailure;
+        internal bool StopFailureObserved;
+
+        internal LifecycleFixture(string name)
+        {
+            DirectoryPath = Path.Combine(Path.GetTempPath(), "lnwjud-lifecycle-" + name + "-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(DirectoryPath);
+            Request = NewServiceAttemptRequest(name + "-" + Guid.NewGuid().ToString("N"), Path.Combine(DirectoryPath, "workspace")) with { AuthenticatedCallerSid = Sid };
+            Ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(Path.Combine(DirectoryPath, "attempts.json")));
+            Ledger.Prepare(Request);
+            Runtime = new WindowsServiceProcessRuntime(Ledger, useCurrentUserTestLauncher: true);
+            Runtime.LifecycleForTest = (stage, pid) =>
+            {
+                if (stage == "after_launch_before_attach")
+                {
+                    Child = Process.GetProcessById(checked((int)pid));
+                    _ = Child.Handle; // Retain this exact owned process instance across PID reuse.
+                    var attempt = Attempt();
+                    const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+                    var fields = attempt.GetType().GetFields(flags);
+                    StdoutHandle = ((AnonymousPipeServerStream)fields.Single(field => field.FieldType == typeof(AnonymousPipeServerStream) && field.Name.Contains("stdoutPipe", StringComparison.Ordinal)).GetValue(attempt)!).SafePipeHandle;
+                    StderrHandle = ((AnonymousPipeServerStream)fields.Single(field => field.FieldType == typeof(AnonymousPipeServerStream) && field.Name.Contains("stderrPipe", StringComparison.Ordinal)).GetValue(attempt)!).SafePipeHandle;
+                    Console.WriteLine($"LIFECYCLE_OWNED_CHILD pid={pid} created={Child.StartTime.ToUniversalTime():O} directory={DirectoryPath}");
+                }
+                Hook?.Invoke(stage, pid);
+            };
+        }
+
+        internal object Attempt()
+        {
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var attempts = (System.Collections.IDictionary)typeof(WindowsServiceProcessRuntime).GetField("attempts", flags)!.GetValue(Runtime)!;
+            return attempts[Request.Identity.AttemptId]!;
+        }
+
+        internal ServiceAttemptObservation Run() => Runtime.Run(Request.Identity, Sid, Request.OperationDigest,
+            new ServiceProcessOperation("run_process", Executable, ["emit-sleep", "10000"], DirectoryPath, 10000, false, EnvironmentBlock, 4096), 0);
+
+        internal ServiceAttemptObservation Inspect() => Runtime.Inspect(Request.Identity, Sid);
+
+        internal void AssertHeld()
+        {
+            var observed = Inspect();
+            if (!observed.ReservationHeld || observed.Phase == ServiceAttemptPhase.TerminalVerified)
+                throw new Exception("Incomplete root/Job proof released its original reservation");
+        }
+
+        internal void AssertDisposed(bool requireStartedReaders = true)
+        {
+            if (Child is null || !Child.WaitForExit(0)) throw new Exception("Cleanup started before the retained root process became signaled");
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var attempt = Attempt();
+            object? Property(string name) => attempt.GetType().GetProperty(name, flags)!.GetValue(attempt);
+            var stdoutReader = Property("StdoutReader");
+            var stderrReader = Property("StderrReader");
+            if (Property("Process") is not null || Property("MonitorTask") is not Task { IsCompleted: true }
+                || (requireStartedReaders || stdoutReader is not null) && stdoutReader is not Task { IsCompleted: true }
+                || (requireStartedReaders || stderrReader is not null) && stderrReader is not Task { IsCompleted: true }
+                || StdoutHandle?.IsClosed != true || StderrHandle?.IsClosed != true)
+                throw new Exception("Stop returned before monitor/readers/process/pipe disposal completed");
+        }
+
+        internal async Task ExpectStopFailure()
+        {
+            try { await Runtime.StopAsync(); }
+            catch (IOException error) when (error.Message.StartsWith("SERVICE_", StringComparison.Ordinal))
+            {
+                StopFailureObserved = true;
+                Console.WriteLine("EXPECTED_LIFECYCLE_STOP_FAILURE " + error.Message);
+                return;
+            }
+            throw new Exception("Incomplete lifecycle was reported as successful shutdown");
+        }
+
+        internal async Task Cleanup()
+        {
+            BeforeCleanup?.Invoke();
+            Exception? failure = null;
+            try
+            {
+                try { await Runtime.StopAsync(); }
+                catch (IOException error) when (ExpectedStopFailure && StopFailureObserved && error.Message.StartsWith("SERVICE_", StringComparison.Ordinal))
+                {
+                    Console.WriteLine("EXPECTED_RETAINED_LIFECYCLE_FAILURE " + error.Message);
+                }
+                if (!ExpectedStopFailure) AssertDisposed();
+            }
+            catch (Exception error) { failure = error; }
+            finally
+            {
+                try
+                {
+                    if (Child is not null)
+                    {
+                        // This fixture alone created and pinned Child; never operate on
+                        // an unrelated PID, installed service or recovered runtime child.
+                        if (!Child.WaitForExit(0) && !TerminateProcess(Child.Handle, 1) && !Child.WaitForExit(0))
+                            throw new Exception("Owned lifecycle child cleanup termination failed");
+                        if (!Child.WaitForExit(10_000)) throw new Exception("Owned lifecycle child cleanup exit unverified");
+                    }
+                }
+                catch (Exception error) { failure = failure is null ? error : new AggregateException(failure, error); }
+                finally { Child?.Dispose(); AfterCleanup?.Invoke(); }
+            }
+            if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    }
+
+    private static async Task PreserveFixtureErrors(Func<Task> body, Func<Task> cleanup)
+    {
+        Exception? assertionFailure = null;
+        try { await body(); }
+        catch (Exception error) { assertionFailure = error; }
+        try { await cleanup(); }
+        catch (Exception cleanupFailure)
+        {
+            if (assertionFailure is not null)
+                throw new AggregateException("Test assertion and cleanup both failed", assertionFailure, cleanupFailure);
+            throw;
+        }
+        if (assertionFailure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(assertionFailure).Throw();
+    }
+
+    private static async Task WithLifecycleFixture(string name, Func<LifecycleFixture, Task> body)
+    {
+        var fixture = new LifecycleFixture(name);
+        var completed = false;
         try
         {
-            var ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(Path.Combine(directory, "attempts.json")));
-            using var current = WindowsIdentity.GetCurrent();
-            var sid = current.User!.Value;
-            var request = NewServiceAttemptRequest("output-reader-failure", Path.Combine(directory, "workspace")) with { AuthenticatedCallerSid = sid };
-            ledger.Prepare(request);
-            runtime = new WindowsServiceProcessRuntime(ledger, useCurrentUserTestLauncher: true);
-            WindowsServiceProcessRuntime.FailOutputReadsForTest = true;
-            runtime.Run(request.Identity, sid, request.OperationDigest,
-                new ServiceProcessOperation("run_process", Executable, ["emit-sleep", "10000"], directory, 10000, false, EnvironmentBlock, 4096), 0);
-            runtime.Cancel(request.Identity, sid);
-            for (var retry = 0; retry < 100; retry++)
+            await PreserveFixtureErrors(async () => { await body(fixture); completed = true; }, fixture.Cleanup);
+            if (!fixture.ExpectedStopFailure)
             {
-                if (ledger.Inspect(request.Identity, sid).Phase == ServiceAttemptPhase.TerminalVerified) break;
-                await Task.Delay(20);
+                Directory.Delete(fixture.DirectoryPath, true); // One attempt, after independently verified completion.
             }
-            await runtime.StopAsync();
-            var terminal = ledger.Inspect(request.Identity, sid);
-            var output = new WindowsServiceProcessRuntime(ledger, useCurrentUserTestLauncher: true).ReadOutput(request.Identity, sid);
-            if (terminal.Phase != ServiceAttemptPhase.TerminalVerified || terminal.ActiveProcesses != 0 || terminal.ReservationHeld
-                || !output.Persisted || output.Complete || output.FinalCursor is not null || output.IncompleteReason != "SERVICE_OUTPUT_READ_FAILED")
-                throw new Exception("Reader failure erased terminal proof or invented complete output");
+            else Console.WriteLine("LIFECYCLE_FAILURE_STATE_EVIDENCE_RETAINED " + fixture.DirectoryPath);
         }
-        finally
+        catch
         {
-            if (runtime is not null) await runtime.StopAsync();
-            WindowsServiceProcessRuntime.FailOutputReadsForTest = false;
-            Directory.Delete(directory, true);
+            Console.Error.WriteLine($"LIFECYCLE_FAILURE_EVIDENCE_RETAINED bodyCompleted={completed} directory={fixture.DirectoryPath}");
+            throw;
         }
+    }
+
+    private static async Task TestLifecycleRootProofFailure(bool apiFailure)
+    {
+        await WithLifecycleFixture(apiFailure ? "root-api-failure" : "root-timeout", async fixture =>
+        {
+            fixture.ExpectedStopFailure = true;
+            fixture.Runtime.JobActiveProcessesForTest = _ => 0;
+            var rootWaitCalls = 0;
+            fixture.Runtime.RootWaitForTest = (_, _) =>
+            {
+                Interlocked.Increment(ref rootWaitCalls);
+                if (apiFailure) throw new IOException("TEST_ROOT_WAIT_API_FAILURE");
+                return false; // A completed bounded wait reports no terminal proof.
+            };
+            fixture.Run();
+            await fixture.ExpectStopFailure();
+            fixture.AssertHeld();
+            fixture.AssertDisposed();
+            if (rootWaitCalls == 0) throw new Exception("Job zero bypassed the retained root-process wait");
+            ExpectFailure<UnauthorizedAccessException>(() => fixture.Runtime.Cancel(fixture.Request.Identity with { Generation = 2 }, fixture.Sid), "ATTEMPT_OWNER_MISMATCH");
+            ExpectFailure<UnauthorizedAccessException>(() => fixture.Runtime.Inspect(fixture.Request.Identity with { OwnerSessionId = "another-session" }, fixture.Sid), "ATTEMPT_OWNER_MISMATCH");
+            fixture.AssertHeld();
+        });
+        Console.WriteLine("PASS root wait " + (apiFailure ? "API failure" : "timeout") + " remains unknown/held and stop fails truthfully");
+    }
+
+    private static async Task TestLifecycleRootProofPending()
+    {
+        await WithLifecycleFixture("root-pending", async fixture =>
+        {
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new ManualResetEventSlim();
+            fixture.BeforeCleanup = release.Set;
+            fixture.AfterCleanup = release.Dispose;
+            fixture.Runtime.JobActiveProcessesForTest = _ => 0;
+            fixture.Runtime.RootWaitForTest = (process, timeout) =>
+            {
+                entered.TrySetResult();
+                if (!release.Wait(10_000)) throw new Exception("Root proof gate was not released");
+                return process.WaitForRootExit(timeout);
+            };
+            fixture.Run();
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            if (fixture.Child is null || fixture.Child.WaitForExit(0)) throw new Exception("Root-pending fixture did not retain a live owned child");
+            fixture.AssertHeld();
+            fixture.Runtime.Cancel(fixture.Request.Identity, fixture.Sid);
+            fixture.AssertHeld(); // Cancellation request alone is not terminal proof.
+            var stop = fixture.Runtime.StopAsync();
+            if (stop.IsCompleted) throw new Exception("Stop skipped an outstanding root-process proof");
+            release.Set();
+            await stop;
+            var terminal = fixture.Inspect();
+            if (terminal.Phase != ServiceAttemptPhase.TerminalVerified || terminal.ReservationHeld || terminal.ActiveProcesses != 0)
+                throw new Exception("Verified root and Job completion did not settle its own attempt");
+        });
+        Console.WriteLine("PASS modeled Job-zero/root-pending and termination-request-before-proof fence");
+    }
+
+    private static async Task TestLifecycleJobRecheck()
+    {
+        await WithLifecycleFixture("job-recheck", async fixture =>
+        {
+            fixture.ExpectedStopFailure = true;
+            var rootObserved = false;
+            fixture.Runtime.JobActiveProcessesForTest = _ => Volatile.Read(ref rootObserved) ? 1U : 0U;
+            fixture.Runtime.RootWaitForTest = (process, timeout) =>
+            {
+                process.Cancel();
+                if (!process.WaitForRootExit(timeout)) throw new Exception("Owned root did not exit for the Job recheck test");
+                Volatile.Write(ref rootObserved, true);
+                return true;
+            };
+            fixture.Run();
+            await fixture.ExpectStopFailure();
+            fixture.AssertHeld();
+            fixture.AssertDisposed();
+            if (!rootObserved) throw new Exception("The retained root wait was never observed");
+        });
+        Console.WriteLine("PASS root exit cannot replace the final zero-descendant Job check");
+    }
+
+    private static async Task TestLifecycleStopBarrier(string blockedStage)
+    {
+        await WithLifecycleFixture(blockedStage, async fixture =>
+        {
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new ManualResetEventSlim();
+            fixture.BeforeCleanup = release.Set;
+            fixture.AfterCleanup = release.Dispose;
+            fixture.Hook = (stage, _) =>
+            {
+                if (stage != blockedStage) return;
+                entered.TrySetResult();
+                if (!release.Wait(10_000)) throw new Exception("Lifecycle attachment/disposal gate was not released");
+            };
+            var run = Task.Run(fixture.Run);
+            if (blockedStage == "after_terminal_before_dispose")
+            {
+                await run;
+                fixture.Runtime.Cancel(fixture.Request.Identity, fixture.Sid);
+            }
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            var firstStop = fixture.Runtime.StopAsync();
+            var secondStop = fixture.Runtime.StopAsync();
+            if (firstStop.IsCompleted || secondStop.IsCompleted)
+                throw new Exception("Stop skipped a pending lifecycle at " + blockedStage);
+            release.Set();
+            await run;
+            await Task.WhenAll(firstStop, secondStop);
+        });
+        Console.WriteLine("PASS concurrent stop waits through " + blockedStage);
+    }
+
+    private static async Task TestLifecycleInterruptedAttachment()
+    {
+        await WithLifecycleFixture("interrupted-attachment", async fixture =>
+        {
+            fixture.ExpectedStopFailure = true;
+            fixture.Hook = (stage, _) => { if (stage == "after_launch_before_attach") throw new IOException("TEST_MONITOR_ATTACHMENT_INTERRUPTED"); };
+            fixture.Run();
+            await fixture.ExpectStopFailure();
+            fixture.AssertHeld();
+            fixture.AssertDisposed(requireStartedReaders: false);
+        });
+        Console.WriteLine("PASS interrupted attachment retains identity/reservation and surfaces shutdown failure");
+    }
+
+    private static async Task TestLifecyclePostTerminalCleanupFailure()
+    {
+        await WithLifecycleFixture("post-terminal-cleanup-failure", async fixture =>
+        {
+            fixture.ExpectedStopFailure = true;
+            fixture.Hook = (stage, _) => { if (stage == "after_terminal_before_dispose") throw new IOException("TEST_POST_TERMINAL_CLEANUP_FAILURE"); };
+            fixture.Run();
+            fixture.Runtime.Cancel(fixture.Request.Identity, fixture.Sid);
+            await fixture.ExpectStopFailure();
+            var terminal = fixture.Inspect();
+            if (terminal.Phase != ServiceAttemptPhase.TerminalVerified || terminal.ReservationHeld || terminal.ActiveProcesses != 0
+                || terminal.Outcome != ServiceProcessOutcome.Cancelled)
+                throw new Exception("Cleanup failure erased proven terminal state or fabricated a held reservation");
+            fixture.AssertDisposed();
+        });
+        Console.WriteLine("PASS post-terminal cleanup failure remains observable without erasing proven terminal state");
+    }
+
+    private static async Task TestLifecycleConcurrentStopCancel()
+    {
+        await WithLifecycleFixture("concurrent-stop-cancel", async fixture =>
+        {
+            fixture.Run();
+            await Task.WhenAll(Task.Run(() => fixture.Runtime.Cancel(fixture.Request.Identity, fixture.Sid)), fixture.Runtime.StopAsync(), fixture.Runtime.StopAsync());
+            var terminal = fixture.Inspect();
+            if (terminal.Phase != ServiceAttemptPhase.TerminalVerified || terminal.ReservationHeld || terminal.ActiveProcesses != 0)
+                throw new Exception("Concurrent stop/cancel did not settle only the owned attempt");
+        });
+        Console.WriteLine("PASS concurrent stop/cancel and idempotent disposal");
+    }
+
+    private static async Task TestFixtureErrorPreservation()
+    {
+        var assertion = new Exception("TEST_ASSERTION_FAILURE");
+        var cleanup = new IOException("TEST_CLEANUP_FAILURE");
+        try { await PreserveFixtureErrors(() => Task.FromException(assertion), () => Task.FromException(cleanup)); }
+        catch (AggregateException error) when (error.InnerExceptions.Count == 2 && ReferenceEquals(error.InnerExceptions[0], assertion) && ReferenceEquals(error.InnerExceptions[1], cleanup))
+        {
+            Console.WriteLine("PASS assertion and cleanup failures preserve both original exceptions");
+            return;
+        }
+        throw new Exception("Cleanup masked the original assertion failure");
+    }
+
+    private static async Task TestNativeLifecycleAsync()
+    {
+        await TestLifecycleRootProofFailure(apiFailure: false);
+        await TestLifecycleRootProofFailure(apiFailure: true);
+        await TestLifecycleRootProofPending();
+        await TestLifecycleJobRecheck();
+        await TestLifecycleStopBarrier("after_terminal_before_dispose");
+        await TestLifecycleStopBarrier("before_monitor_assignment");
+        await TestLifecycleInterruptedAttachment();
+        await TestLifecyclePostTerminalCleanupFailure();
+        await TestLifecycleConcurrentStopCancel();
+        await TestOutputReaderFailure();
+        await TestFixtureErrorPreservation();
+        Console.WriteLine("PASS isolated native lifecycle regressions");
+    }
+
+    private static async Task TestOutputReaderFailure()
+    {
+        try
+        {
+            await WithLifecycleFixture("output-reader-failure", async fixture =>
+            {
+                WindowsServiceProcessRuntime.FailOutputReadsForTest = true;
+                fixture.Run();
+                fixture.Runtime.Cancel(fixture.Request.Identity, fixture.Sid);
+                await fixture.Runtime.StopAsync();
+                fixture.AssertDisposed();
+                var terminal = fixture.Inspect();
+                var output = new WindowsServiceProcessRuntime(fixture.Ledger, useCurrentUserTestLauncher: true).ReadOutput(fixture.Request.Identity, fixture.Sid);
+                if (terminal.Phase != ServiceAttemptPhase.TerminalVerified || terminal.ActiveProcesses != 0 || terminal.ReservationHeld
+                    || !output.Persisted || output.Complete || output.FinalCursor is not null || output.IncompleteReason != "SERVICE_OUTPUT_READ_FAILED")
+                    throw new Exception("Reader failure erased terminal proof or invented complete output");
+            });
+        }
+        finally { WindowsServiceProcessRuntime.FailOutputReadsForTest = false; }
+        Console.WriteLine("PASS reader failure with owned cwd waits for root/monitor/readers/disposal before one-shot cleanup");
     }
 
     internal static async Task<System.Text.Json.JsonDocument> SendServiceRpcAsync(string pipeName, byte[] payload)
@@ -2123,14 +2725,18 @@ internal static class NativeTests
             var store = Path.Combine(directory, "attempts.json");
             var ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(store)); ledger.Prepare(request);
             var runtime = new WindowsServiceProcessRuntime(ledger, useCurrentUserTestLauncher: true);
+            Task? stopDuringCollision = null;
             runtime.BeforeCollisionRecovery = () =>
             {
-                runtime.StopAsync().GetAwaiter().GetResult();
-                if (ledger.Inspect(request.Identity, callerSid).Phase != ServiceAttemptPhase.TerminationUnknown)
-                    throw new Exception("Service stop did not reach the unknown-launch race");
+                // Stop owns a completion barrier for this Run. Start shutdown here
+                // but await it only after Run can publish its no-launch proof.
+                stopDuringCollision = runtime.StopAsync();
+                if (!ledger.Inspect(request.Identity, callerSid).CancellationRequested)
+                    throw new Exception("Service stop did not durably request cancellation during launch");
             };
             var operation = new ServiceProcessOperation("run_process", Executable, ["mark", marker], Environment.CurrentDirectory, 10_000, false, EnvironmentBlock, 1024);
             var result = runtime.Run(request.Identity, callerSid, request.OperationDigest, operation, 0);
+            (stopDuringCollision ?? throw new Exception("Collision shutdown hook was not reached")).GetAwaiter().GetResult();
             if (result.Phase != ServiceAttemptPhase.LaunchNotStarted || result.ReservationHeld || first.ActiveProcesses == 0 || File.Exists(marker))
                 throw new Exception("Proven prelaunch Job collision did not release only its own never-started reservation");
             var persisted = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(store)).Inspect(request.Identity, callerSid);

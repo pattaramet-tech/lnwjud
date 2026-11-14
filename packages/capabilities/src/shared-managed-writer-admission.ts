@@ -78,6 +78,9 @@ export class SharedManagedWriterAdmission {
     if (this.platform === 'darwin' && input.kind !== 'synchronous_mutation') {
       return err(appError('CONFLICT', 'macOS process writer containment unavailable: escaped descendants are not kernel-fenced'));
     }
+    if (this.platform === 'win32' && input.kind === 'uncontained_process') {
+      return err(appError('CONFLICT', 'Windows process writers require trusted native containment; no reservation was created'));
+    }
     const id = 'managed-writer-' + randomUUID();
     const digest = createHash('sha256').update(JSON.stringify([id, input.actorClientId, input.actorSessionId, input.workspaceId])).digest('hex');
     const nativeBinding = input.kind === 'contained_process' ? parseNativeAttemptBinding({
@@ -90,12 +93,17 @@ export class SharedManagedWriterAdmission {
         return err(appError('INVALID_INPUT', 'Contained writer native attempt or session identity is invalid'));
       }
       if (this.nativeAuthority === undefined) {
-        return err(appError('INVALID_INPUT', 'Contained writer trusted native authority is unavailable'));
+        return err(appError('CONFLICT', 'Contained writer trusted native authority is unavailable; review the protected All Users installation before retrying', true));
       }
       if (input.nativeReceiptPath === undefined || !path.isAbsolute(input.nativeReceiptPath)
         || path.basename(input.nativeReceiptPath) !== 'containment.receipt.json'
         || path.basename(path.dirname(input.nativeReceiptPath)) !== nativeBinding.taskId) {
         return err(appError('INVALID_INPUT', 'Contained writer receipt path does not match native attempt identity'));
+      }
+      const availability = await this.nativeAuthority.checkServiceAvailability();
+      if (availability.state !== 'available') {
+        return err({ ...appError('CONFLICT', 'Trusted Windows containment service is unavailable; no reservation was created. Review the protected All Users installation before retrying', true),
+          details: { containment_reason: availability.reason } });
       }
     }
     const reserved = await this.index.reserve({

@@ -57,6 +57,22 @@ describe('workspace writer lease control through the registry', () => {
     expect(JSON.stringify(f.recorded)).not.toContain(f.proof.leaseToken);
   });
 
+  it('returns structured release content across acquire, release and status', async () => {
+    const f = await fixture();
+    const statusBefore = await measure('status-active', () => f.owner.invoke('workspace_writer_lease_status', { workspaceId: 'workspace-a' }));
+    expect(statusBefore.isError).not.toBe(true);
+    expect(statusBefore.structuredContent).toMatchObject({ state: 'active' });
+    const released = await measure('release', () => f.owner.invoke('workspace_writer_lease_release', { workspaceId: 'workspace-a', writerLease: f.proof }));
+    expect(released.isError).not.toBe(true);
+    // Every tool advertises an output schema, so a successful release must
+    // carry structured content or MCP hosts reject the response.
+    expect(released.structuredContent).toMatchObject({ released: true, workspaceId: 'workspace-a' });
+    const statusAfter = await measure('status-unleased', () => f.owner.invoke('workspace_writer_lease_status', { workspaceId: 'workspace-a' }));
+    expect(statusAfter.isError).not.toBe(true);
+    expect(statusAfter.structuredContent).toMatchObject({ state: 'unleased', activeCalls: 0 });
+    expect(JSON.stringify(f.recorded)).not.toContain(f.proof.leaseToken);
+  });
+
   it('renews persisted expiry and releases the acquired lease without recording credentials', async () => {
     const f = await fixture();
     f.advance();

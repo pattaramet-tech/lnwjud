@@ -21,6 +21,7 @@ async function fixture(): Promise<{
   const aborted = new Map<string, NativeAttemptBinding>();
   const client: WindowsContainmentServiceClient = {
     async request<T>(request: WindowsContainmentRpcRequest): Promise<T> {
+      if (request.command === 'check_readiness') return { protocol: 3, state: 'ready' } as T;
       const existing = aborted.get(request.identity.attemptId);
       if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(request.identity)) throw new Error('SERVICE_IDENTITY_MISMATCH');
       if (request.command === 'abort') aborted.set(request.identity.attemptId, request.identity);
@@ -95,7 +96,7 @@ describe('SharedManagedWriterAdmission authenticated release', () => {
       code: 'INVALID_INPUT', message: 'Contained writer receipt path does not match native attempt identity',
     } });
     expect(await new SharedManagedWriterAdmission(f.taskDirectory).enter(f.input)).toMatchObject({ ok: false, error: {
-      code: 'INVALID_INPUT', message: 'Contained writer trusted native authority is unavailable',
+      code: 'CONFLICT',
     } });
   });
 
@@ -124,7 +125,7 @@ describe('SharedManagedWriterAdmission authenticated release', () => {
 
   it.skipIf(process.platform === 'darwin')('retains an old uncontained reservation after restart rather than inferring descendants are gone', async () => {
     const f = await fixture();
-    expect(await f.admission.enter({ actorClientId: 'old-host', workspaceId: 'workspace', kind: 'uncontained_process' })).toMatchObject({ ok: true });
+    expect(await new SharedManagedWriterAdmission(f.taskDirectory, undefined, 'linux').enter({ actorClientId: 'old-host', workspaceId: 'workspace', kind: 'uncontained_process' })).toMatchObject({ ok: true });
     expect(await new SharedManagedWriterAdmission(f.taskDirectory, f.authority).holdExclusiveProbe('workspace')).toMatchObject({ ok: false });
   });
 });

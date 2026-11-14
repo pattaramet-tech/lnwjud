@@ -200,7 +200,7 @@ export class DurableShellTaskStore {
       return err(appError('CONFLICT', 'macOS durable shell unavailable: escaped descendants cannot be kernel-contained'));
     }
     if (this.platform === 'win32' && this.windowsNativeAuthority === undefined) {
-      return err(appError('INTERNAL_ERROR', 'Trusted Windows native containment is unavailable; repair the installed helper before launching work', true));
+      return err(appError('CONFLICT', 'Trusted Windows native containment is unavailable; review the protected All Users installation before launching work', true));
     }
     if (this.platform !== 'win32') {
       try {
@@ -217,6 +217,13 @@ export class DurableShellTaskStore {
       nativeBinding = this.platform === 'win32' ? durableShellNativeBinding(request, requestDigest) : undefined;
     } catch {
       return err(appError('INVALID_INPUT', 'Native containment requires a registered workspace identity'));
+    }
+    if (nativeBinding !== undefined && this.windowsNativeAuthority !== undefined) {
+      const availability = await this.windowsNativeAuthority.checkServiceAvailability();
+      if (availability.state !== 'available') {
+        return err({ ...appError('CONFLICT', 'Trusted Windows containment service is unavailable; no reservation was created. Review the protected All Users installation before retrying', true),
+          details: { containment_reason: availability.reason } });
+      }
     }
     const startedAt = new Date().toISOString();
     const reservation = await this.activeIndex.reserve({
@@ -365,17 +372,17 @@ export class DurableShellTaskStore {
     return this.activeIndex.diagnostics();
   }
 
-  public async list(owner?: CapabilityTaskOwner): Promise<Record<string, unknown>[]> {
-    await mkdir(this.rootDirectory, { recursive: true });
+  public async list(owner?: CapabilityTaskOwner, readOnly = false): Promise<Record<string, unknown>[]> {
+    if (!readOnly) await mkdir(this.rootDirectory, { recursive: true });
     const taskIds = (await readdir(this.rootDirectory, { withFileTypes: true }).catch(() => []))
       .filter((entry) => entry.isDirectory() && entry.name !== '.index')
       .map((entry) => entry.name);
     const hydrated = await mapWithConcurrency(taskIds, 16, async (taskId) => {
-      const metadata = await this.readMetadata(taskId);
+      const metadata = await this.readMetadata(taskId, !readOnly);
       if (!metadata.ok) return undefined;
       if (owner !== undefined && !capabilityTaskOwnerCanInspect(metadataOwner(metadata.value), owner)) return undefined;
-      const reconciled = await this.reconcile(metadata.value);
-      await this.releaseTerminalReservation(reconciled);
+      const reconciled = readOnly ? metadata.value : await this.reconcile(metadata.value);
+      if (!readOnly) await this.releaseTerminalReservation(reconciled);
       return this.snapshotFromMetadata(reconciled, undefined, false);
     });
     const snapshots = hydrated.filter((snapshot): snapshot is Record<string, unknown> => snapshot !== undefined);
@@ -386,18 +393,20 @@ export class DurableShellTaskStore {
     owner: CapabilityTaskOwner,
     limit: number,
     cursor?: string,
+    readOnly = false,
   ): Promise<Result<{ readonly tasks: readonly Record<string, unknown>[]; readonly nextCursor?: string }>> {
     const page = await this.activeIndex.listLaunches({
       limit,
+      readOnly,
       ...(cursor === undefined ? {} : { cursor }),
       accept: (record) => capabilityTaskOwnerCanInspect(launchRecordOwner(record), owner),
     });
     if (!page.ok) return page;
     const hydrated = await mapWithConcurrency(page.value.records, 16, async (record) => {
-      const metadata = await this.readMetadata(record.taskId);
+      const metadata = await this.readMetadata(record.taskId, !readOnly);
       if (!metadata.ok || !capabilityTaskOwnerCanInspect(metadataOwner(metadata.value), owner)) return undefined;
-      const reconciled = await this.reconcile(metadata.value);
-      await this.releaseTerminalReservation(reconciled);
+      const reconciled = readOnly ? metadata.value : await this.reconcile(metadata.value);
+      if (!readOnly) await this.releaseTerminalReservation(reconciled);
       return this.snapshotFromMetadata(reconciled, undefined, false);
     });
     const tasks = hydrated.filter((snapshot): snapshot is Record<string, unknown> => snapshot !== undefined);

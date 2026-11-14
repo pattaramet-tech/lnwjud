@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -50,6 +50,9 @@ export type NativeProcessObservation =
   | { readonly state: 'running'; readonly binding: NativeAttemptBinding; readonly targetPid: number }
   | { readonly state: 'terminal_verified'; readonly binding: NativeAttemptBinding; readonly outcome: 'completed' | 'cancelled' | 'timed_out' | 'interrupted'; readonly exitCode: number; readonly activeProcesses: 0 }
   | { readonly state: 'termination_unknown'; readonly binding: NativeAttemptBinding; readonly reason: string };
+export type NativeServiceAvailability =
+  | { readonly state: 'available' }
+  | { readonly state: 'unavailable'; readonly reason: string };
 export type NativeControlCommand = 'prepare_import' | 'publish_import' | 'inspect_publication';
 export type NativeControlObservation =
   | { readonly state: 'control_verified'; readonly binding: NativeAttemptBinding; readonly command: NativeControlCommand; readonly result: unknown }
@@ -84,7 +87,7 @@ export interface NativeProcessRequest {
 }
 export type WindowsContainmentRpcRequest = { readonly protocol: 3; readonly identity: NativeAttemptBinding } & (
   | { readonly command: 'prepare' | 'run'; readonly operation: NativeServiceProcessOperation; readonly reservationKey?: string; readonly operationDigest?: string }
-  | { readonly command: 'inspect' | 'cancel' }
+  | { readonly command: 'inspect' | 'cancel' | 'check_readiness' }
   | { readonly command: 'recover_after_reboot'; readonly recordedAt: string }
   | { readonly command: 'read_output'; readonly outputCursor?: NativeOutputCursor }
   | ({ readonly command: 'abort'; readonly reservationKey: string } & (
@@ -118,6 +121,28 @@ export class WindowsNativeAuthority {
     this.client = client ?? new ProcessWindowsContainmentServiceClient(configuration);
   }
   public get config(): WindowsNativeAuthorityConfiguration { return this.configuration; }
+
+  /**
+   * The authenticated service checks its ledger without creating or observing
+   * an attempt. Readiness is distinct from process termination evidence, and
+   * no error (including an ownership refusal) can establish readiness.
+   */
+  public async checkServiceAvailability(): Promise<NativeServiceAvailability> {
+    const id = randomUUID();
+    const identity: NativeAttemptBinding = {
+      taskId: id, reservationId: id, attemptId: randomUUID(), generation: 1,
+      requestDigest: createHash('sha256').update(id).digest('hex'),
+      ownerClientId: 'lnwjud-containment-readiness', ownerSessionId: id, workspaceId: id,
+    };
+    try {
+      const response = await this.client.request<unknown>({ protocol: 3, command: 'check_readiness', identity });
+      return isRecord(response) && Object.keys(response).length === 2 && response.protocol === 3 && response.state === 'ready'
+        ? { state: 'available' }
+        : { state: 'unavailable', reason: 'NATIVE_SERVICE_READINESS_UNVERIFIED' };
+    } catch (error: unknown) {
+      return { state: 'unavailable', reason: serviceFailureCode(error, 'NATIVE_SERVICE_READINESS_UNAVAILABLE') };
+    }
+  }
 
   public async clearStaleTunnelAlias(request: StaleTunnelAliasCleanupRequest): Promise<void> {
     if (process.platform !== 'win32') throw new Error('TUNNEL_STALE_WINDOWS_REQUIRED');

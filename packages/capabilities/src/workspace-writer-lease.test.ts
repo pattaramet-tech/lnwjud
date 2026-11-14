@@ -4,7 +4,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { appError } from '@lnwjud/domain';
-import { SqliteWorkspaceWriterLease, type WorkspaceWriterGlobalExclusion } from './workspace-writer-lease.js';
+import { SqliteWorkspaceWriterLease, type WorkspaceWriterGlobalExclusion, type WorkspaceWriterLeaseProof } from './workspace-writer-lease.js';
 
 const roots: string[] = [];
 const WINDOWS_WRITER_IO_TEST_TIMEOUT_MS = process.platform === 'win32' ? 20_000 : 5_000;
@@ -21,6 +21,90 @@ async function fixture(now?: () => number): Promise<{ one: SqliteWorkspaceWriter
 }
 
 describe('durable multi-session workspace writer lease', () => {
+  it('rejects missing or malformed control proofs before probing shared writer admission', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-invalid-writer-proof-'));
+    roots.push(root);
+    let probeCalls = 0;
+    const exclusion: WorkspaceWriterGlobalExclusion = {
+      async holdExclusiveProbe(): ReturnType<WorkspaceWriterGlobalExclusion['holdExclusiveProbe']> {
+        probeCalls += 1;
+        return { ok: true, value: { releaseAfterVerifiedTermination: async (): Promise<void> => undefined } };
+      },
+    };
+    const lease = new SqliteWorkspaceWriterLease(path.join(root, 'fences.sqlite'), () => 100_000, exclusion);
+    const acquired = await lease.acquire('workspace', 'owner', 'session', 60);
+    if (!acquired.ok) throw new Error('lease not acquired');
+    const proof = acquired.value;
+    const malformed: readonly unknown[] = [
+      undefined, null, false, 1, 'proof', [], {},
+      { ...proof, leaseId: undefined }, { ...proof, leaseId: 'not-a-uuid' },
+      { ...proof, leaseId: '00000000-0000-0000-8000-000000000000' },
+      { ...proof, leaseId: '00000000-0000-9000-8000-000000000000' },
+      { ...proof, leaseId: '00000000-0000-4000-7000-000000000000' },
+      { ...proof, leaseId: 'FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF' },
+      { ...proof, leaseToken: undefined }, { ...proof, leaseToken: 1 },
+      { ...proof, leaseToken: '' }, { ...proof, leaseToken: 'x'.repeat(257) },
+      { ...proof, generation: undefined }, { ...proof, generation: '1' },
+      { ...proof, generation: -1 }, { ...proof, generation: 1.5 },
+      { ...proof, generation: Number.NaN }, { ...proof, generation: Infinity },
+      { ...proof, generation: Number.MAX_SAFE_INTEGER + 1 },
+    ];
+    const beforeProbes = probeCalls;
+    const beforeStatus = await lease.inspect('workspace');
+    for (const candidate of malformed) {
+      const input = candidate as WorkspaceWriterLeaseProof;
+      expect(await lease.renew('workspace', 'owner', 'session', input, 600))
+        .toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+      expect(await lease.release('workspace', 'owner', 'session', input))
+        .toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+    }
+    expect(probeCalls).toBe(beforeProbes);
+    expect(await lease.inspect('workspace')).toEqual(beforeStatus);
+    expect(await lease.release('workspace', 'owner', 'session', proof)).toMatchObject({ ok: true });
+  }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
+
+  it('retains ownership and generation fences for shape-valid control proofs', async () => {
+    const { one } = await fixture(() => 100_000);
+    const acquired = await one.acquire('workspace', 'owner', 'session', 60);
+    if (!acquired.ok) throw new Error('lease not acquired');
+    const proof = acquired.value;
+    const foreign = [
+      { client: 'other-owner', session: 'session', proof },
+      { client: 'owner', session: 'other-session', proof },
+      { client: 'owner', session: 'session', proof: { ...proof, generation: proof.generation + 1 } },
+      { client: 'owner', session: 'session', proof: { ...proof, leaseToken: 'foreign-token' } },
+    ];
+    const beforeStatus = await one.inspect('workspace');
+    for (const candidate of foreign) {
+      expect(await one.renew('workspace', candidate.client, candidate.session, candidate.proof, 600))
+        .toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+      expect(await one.release('workspace', candidate.client, candidate.session, candidate.proof))
+        .toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    }
+    expect(await one.inspect('workspace')).toEqual(beforeStatus);
+    expect(await one.renew('workspace', 'owner', 'session', proof, 600)).toMatchObject({ ok: true });
+    expect(await one.release('workspace', 'owner', 'session', proof)).toMatchObject({ ok: true });
+  }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
+
+  it('accepts schema-valid UUID variants and safe generation bounds before applying identity fences', async () => {
+    const { one } = await fixture();
+    const acquired = await one.acquire('workspace', 'owner', 'session', 60);
+    if (!acquired.ok) throw new Error('lease not acquired');
+    for (const leaseId of [
+      '00000000-0000-0000-0000-000000000000',
+      'ffffffff-ffff-ffff-ffff-ffffffffffff',
+      '00000000-0000-7000-8000-000000000000',
+      '00000000-0000-8000-B000-000000000000',
+    ]) {
+      const proof = { ...acquired.value, leaseId, leaseToken: 'x'.repeat(256), generation: Number.MAX_SAFE_INTEGER };
+      expect(await one.renew('workspace', 'owner', 'session', proof, 60))
+        .toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+      expect(await one.release('workspace', 'owner', 'session', proof))
+        .toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    }
+    expect(await one.release('workspace', 'owner', 'session', acquired.value)).toMatchObject({ ok: true });
+  }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
+
   it('refuses release during native writer activity instead of creating an unleased mutation window', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-release-native-block-'));
     roots.push(root);
