@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -760,7 +760,8 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
       binding,
       workerPid: 99999999, // gone
     });
-    await writeFile(path.join(taskDir, 'task.json'), JSON.stringify(metadata));
+    const metadataPath = path.join(taskDir, 'task.json');
+    await writeFile(metadataPath, JSON.stringify({ ...metadata, output_finalized: true }));
 
     await (f.store as unknown as { activeIndex: { reserve: (input: unknown) => Promise<unknown> } }).activeIndex.reserve({
       taskId,
@@ -782,13 +783,14 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
     if (!recovered.ok) return;
     expect(recovered.value.generation).toBe(2);
 
-    // Verify task.json was safely reconciled to failed with exit_code -1
+    // Recovery proves termination but cannot validate the previous worker's output.
     const snapshot = await f.store.snapshot(taskId, undefined, { clientId, sessionId: 'session-2', workspaceId });
     expect(snapshot.ok).toBe(true);
     if (snapshot.ok) {
       expect(snapshot.value.state).toBe('failed');
       expect(snapshot.value.exit_code).toBe(125); // Interrupted after reboot; no fabricated target exit status.
     }
+    expect(JSON.parse(await readFile(metadataPath, 'utf8'))).toMatchObject({ output_finalized: false });
   }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
 
   it('14. Managed Writer Undispatched Attempt Recovery: aborts undispatched attempt and unblocks repository import', async () => {

@@ -953,8 +953,10 @@ export class DurableShellTaskStore {
     if (!readback.ok || readback.value.containmentBinding === undefined || !nativeBindingMatchesMetadata(readback.value, binding)) return unknown();
     const current = readback.value;
     if (current.state === expectedState && current.exit_code === expectedExitCode && current.finished_at !== undefined) return current;
+    // The service proved termination, but the worker did not finalize matching
+    // output. A recovered outcome alone cannot authenticate the local log files.
     const finalized = { ...current, state: expectedState, exit_code: expectedExitCode,
-      finished_at: current.finished_at ?? new Date().toISOString() };
+      finished_at: current.finished_at ?? new Date().toISOString(), output_finalized: false };
     delete finalized.error;
     await this.writeMetadata(finalized);
     return finalized;
@@ -1521,6 +1523,8 @@ let timer;
 let child;
 let nativeAuthority;
 let nativeInvocation;
+let nativeConnectionStarted = false;
+let nativeOutputComplete = false;
 let posixRuntime;
 let posixControlTimer;
 let posixControlBusy = false;
@@ -1676,13 +1680,13 @@ async function stopTree(pid) {
   return !processRunning(pid);
 }
 
-async function containmentReceipt() {
-  if (!spec.native || !nativeAuthority) return undefined;
-  const proof = await nativeAuthority.inspect({ directory: spec.native.directory, binding: spec.native.binding });
-  return proof.state === 'terminal_verified' || proof.state === 'launch_not_started' ? proof : undefined;
+function verifiedNativeReceipt(proof) {
+  if (proof?.state !== 'terminal_verified' && proof?.state !== 'launch_not_started') return undefined;
+  if (proof.state === 'terminal_verified' && proof.activeProcesses !== 0) return undefined;
+  return Object.keys(spec.native.binding).every((field) => proof.binding?.[field] === spec.native.binding[field]) ? proof : undefined;
 }
 
-async function finish(state, exitCode, error) {
+async function finish(state, exitCode, error, nativeProof) {
   if (settled) return;
   if (spec.posix) {
     if (!child?.pid) metadata.posix_launch_not_started = true;
@@ -1716,10 +1720,17 @@ async function finish(state, exitCode, error) {
   settled = true;
   if (posixControlTimer) clearInterval(posixControlTimer);
   if (spec.native && state !== 'termination_unverified') {
-    if (state === 'failed' && nativeAuthority) await nativeAuthority.abortBeforeLaunch({ directory: spec.native.directory, binding: spec.native.binding }).catch(() => undefined);
-    const receipt = await containmentReceipt();
-    if (!receipt) { state = 'termination_unverified'; error = 'Native containment has no verified terminal receipt'; }
-    else if (receipt.state === 'launch_not_started') { state = 'failed'; exitCode = -1; }
+    const location = { directory: spec.native.directory, binding: spec.native.binding };
+    if (!nativeConnectionStarted && state === 'failed' && nativeAuthority) {
+      nativeProof = await (nativeInvocation?.abortBeforeLaunch() ?? nativeAuthority.abortBeforeLaunch(location)).catch(() => undefined);
+    }
+    const receipt = verifiedNativeReceipt(nativeProof) ?? verifiedNativeReceipt(await nativeAuthority?.inspect(location));
+    if (!receipt) {
+      state = 'termination_unverified';
+      exitCode = -1;
+      error = error ?? nativeProof?.reason ?? 'Native containment has no verified terminal receipt';
+    }
+    else if (receipt.state === 'launch_not_started') { state = 'failed'; exitCode = -1; nativeOutputComplete = true; }
     else { state = receipt.outcome === 'completed' ? (receipt.exitCode === 0 ? 'completed' : 'failed') : receipt.outcome; exitCode = receipt.exitCode; }
   }
   settled = true;
@@ -1732,7 +1743,8 @@ async function finish(state, exitCode, error) {
   else metadata.finished_at = new Date().toISOString();
   await Promise.allSettled([...pendingWrites]);
   const outputClosed = await Promise.allSettled([stdoutHandle.close(), stderrHandle.close()]);
-  metadata.output_finalized = !outputWriteFailed && outputClosed.every((result) => result.status === 'fulfilled');
+  metadata.output_finalized = (!spec.native || state !== 'termination_unverified' && nativeOutputComplete) && !outputWriteFailed
+    && outputClosed.every((result) => result.status === 'fulfilled');
   const persisted = await persist().then(() => true, () => false);
   if (persisted && state !== 'termination_unverified') {
     await releaseReservation();
@@ -1742,7 +1754,7 @@ async function finish(state, exitCode, error) {
   }
 }
 
-try {
+async function runWorker() {
   const childEnvironment = { ...process.env };
   delete childEnvironment.ELECTRON_RUN_AS_NODE;
   if (spec.electronRunAsNode) childEnvironment.ELECTRON_RUN_AS_NODE = '1';
@@ -1776,6 +1788,26 @@ try {
   metadata.child_pid = child.pid;
   child.stdout?.on('data', (chunk) => { appendBounded(stdoutHandle, chunk, 'stdout'); });
   child.stderr?.on('data', (chunk) => { appendBounded(stderrHandle, chunk, 'stderr'); });
+  if (nativeInvocation) {
+    // This child is the service output watcher. Fast targets can reach their
+    // authenticated terminal state before the watcher has forwarded any bytes.
+    // Wait for both the dispatch response and the watcher's drained pipes.
+    const watcherClosed = new Promise((resolve) => {
+      child.once('close', resolve);
+      child.once('error', () => { /* A failed spawn also emits close. */ });
+    });
+    nativeConnectionStarted = true;
+    const start = await nativeInvocation.connect(child);
+    if (start.state === 'running') {
+      metadata.state = 'running';
+      const startedAt = child.pid ? await processStartedAt(child.pid) : null;
+      if (startedAt !== null) metadata.child_started_at = startedAt;
+      await persist();
+    }
+    nativeOutputComplete = (await watcherClosed) === 0;
+    await finish('completed', 0, undefined, start);
+    return;
+  }
   child.once('close', () => { posixPipesClosed = true; });
   child.once('error', (error) => { void finish('failed', -1, 'Local task failed to start: ' + error.message); });
   child.once('exit', (code) => {
@@ -1827,18 +1859,10 @@ try {
       })().catch(() => undefined).finally(() => { posixControlBusy = false; });
     }, 100);
   }
-  if (nativeInvocation) {
-    const start = await nativeInvocation.connect(child);
-    if (!settled) {
-      if (start.state === 'running') metadata.state = 'running';
-      else if (start.state === 'terminal_verified' || start.state === 'launch_not_started') await finish('completed', 0);
-      else { metadata.state = 'termination_unverified'; metadata.error = start.reason; }
-    }
-  }
   metadata.child_started_at = child.pid ? await processStartedAt(child.pid) : null;
   if (metadata.child_started_at === null) delete metadata.child_started_at;
   if (!settled) await persist();
-  if (!settled && !spec.native) timer = setTimeout(() => {
+  if (!settled) timer = setTimeout(() => {
     void (async () => {
       if (settled || !child?.pid) return;
       stopTarget = 'timed_out';
@@ -1847,7 +1871,12 @@ try {
       await finish(stopped ? 'timed_out' : 'termination_unverified', -1, stopped ? 'Local task timed out' : 'Local task timed out, but process termination could not be verified');
     })();
   }, spec.timeoutMs);
+}
+
+try {
+  await runWorker();
 } catch (error) {
+  if (nativeConnectionStarted) child?.stdin?.destroy();
   await finish('failed', -1, 'Local task failed to start: ' + (error instanceof Error ? error.message : String(error)));
 }
 `;

@@ -31,6 +31,11 @@ export function isProvablyReadOnlyGitInvocation(args: readonly string[]): boolea
   if (first === 'stash') return rest.length > 0 && ['list', 'show'].includes(rest[0]!.toLowerCase());
   if (first === 'symbolic-ref') return isReadOnlySymbolicRef(rest);
   if (first === 'tag') return isReadOnlyTag(rest);
+  if (args[0] === 'worktree' && rest[0] === 'list') {
+    const options = rest.slice(1);
+    return options.every((option) => ['--porcelain', '-z', '-v', '--verbose'].includes(option)) &&
+      (!options.includes('-z') || options.includes('--porcelain'));
+  }
   return false;
 }
 

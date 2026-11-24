@@ -77,3 +77,30 @@ describe('prohibitedAgentGitInvocationReason', () => {
     expect(isProvablyReadOnlyGitInvocation(['commit', '-m', 'message'])).toBe(false);
   });
 });
+
+describe('read-only worktree classification', () => {
+  it.each([
+    ['worktree', 'list'],
+    ['worktree', 'list', '--porcelain'],
+    ['worktree', 'list', '--porcelain', '-z'],
+    ['worktree', 'list', '--verbose'],
+  ] as const)('accepts git %s', (...args) => {
+    expect(isProvablyReadOnlyGitInvocation(args)).toBe(true);
+  });
+
+  it.each([
+    ['worktree', 'add', 'other'],
+    ['worktree', 'lock', 'other'],
+    ['worktree', 'move', 'old', 'new'],
+    ['worktree', 'prune'],
+    ['worktree', 'remove', 'other'],
+    ['worktree', 'repair', 'other'],
+    ['worktree', 'unlock', 'other'],
+    ['worktree', 'list', '--porcelain', 'unexpected'],
+    ['worktree', 'list', '-z'],
+    ['WORKTREE', 'list', '--porcelain'],
+    ['-C', 'other', 'worktree', 'list', '--porcelain'],
+  ] as const)('does not classify git %s as read-only', (...args) => {
+    expect(isProvablyReadOnlyGitInvocation(args)).toBe(false);
+  });
+});

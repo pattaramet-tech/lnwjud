@@ -334,7 +334,13 @@ export class WindowsNativeAuthority {
             await this.client.startWatcher(child, input.binding);
             const response = await this.client.request<unknown>({ protocol: 3, command: 'run', identity: input.binding, operation });
             const observation = toObservation(response, input.binding);
-            if (observation.state === 'launch_not_started' || observation.state === 'termination_unknown') child.stdin?.end();
+            // A fast process can reach Job zero before the service publishes
+            // release. The authenticated watcher must stay connected through
+            // that window to observe publication and forward final output.
+            const awaitingRelease = observation.state === 'termination_unknown'
+              && observation.reason === 'NATIVE_TERMINAL_PROOF_INCOMPLETE'
+              && isRecord(response) && response.phase === 4 && response.activeProcesses === 0 && response.reservationHeld === true;
+            if (observation.state === 'launch_not_started' || (observation.state === 'termination_unknown' && !awaitingRelease)) child.stdin?.end();
             return observation;
           } catch (error: unknown) {
             child.stdin?.destroy();

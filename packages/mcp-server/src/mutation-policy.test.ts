@@ -14,6 +14,11 @@ interface MutationCase {
 
 const cases: readonly MutationCase[] = [
   { label: 'read-only git status', tool: 'git', input: { args: ['status', '--short'] }, permission: 'EXECUTE', kind: 'read' },
+  { label: 'read-only worktree list', tool: 'git', input: { args: ['worktree', 'list', '--porcelain'] }, permission: 'EXECUTE', kind: 'read' },
+  { label: 'worktree add', tool: 'git', input: { args: ['worktree', 'add', 'other'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },
+  { label: 'worktree remove', tool: 'git', input: { args: ['worktree', 'remove', 'other'] }, permission: 'EXECUTE', kind: 'delete' },
+  { label: 'worktree prune', tool: 'git', input: { args: ['worktree', 'prune'] }, permission: 'EXECUTE', kind: 'delete' },
+  { label: 'unrecognized worktree list operand', tool: 'git', input: { args: ['worktree', 'list', '--porcelain', 'other'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },
   { label: 'git index replacement', tool: 'git', input: { args: ['add', '--', 'src/a.ts'] }, permission: 'EXECUTE', kind: 'replace' },
   { label: 'git scope override before clean', tool: 'git', input: { args: ['-C', 'E:\\outside', 'clean', '-fd'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },
   { label: 'git config alias with an operand', tool: 'git', input: { args: ['-c', 'alias.wipe=!rm -rf .', 'wipe'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },

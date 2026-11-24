@@ -1,7 +1,8 @@
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { appError, err } from '@lnwjud/domain';
 import type { GitAdapter } from '@lnwjud/git';
 import type { Workspace, WorkspaceRepository } from '@lnwjud/workspace';
 import { GitService } from './git-service.js';
@@ -145,6 +146,31 @@ describe('GitService', () => {
       ok: true,
       value: { exitCode: 0, stdout: 'Initialized empty Git repository', stderr: '' },
     });
+  });
+
+  it('runs porcelain worktree inspection without writer admission and gates worktree creation', async () => {
+    const workspace = await createWorkspace();
+    const actor = { clientId: 'test', clientName: 'test' };
+    const output = { exitCode: 0, stdout: `worktree ${workspace.realRootPath}\n`, stderr: '' };
+    const run = vi.fn<GitAdapter['run']>().mockResolvedValue({ ok: true, value: output });
+    const enter = vi.fn(async () => err(appError('CONFLICT', 'A writer is already active')));
+    const service = new GitService(repository(workspace), undefined, { run } as unknown as GitAdapter, {
+      writerAdmission: { enter },
+      nativeContainmentRoot: workspace.realRootPath,
+    });
+
+    const args = ['worktree', 'list', '--porcelain'];
+    await expect(service.run(actor, { args, workspaceId: workspace.id })).resolves.toEqual({ ok: true, value: output });
+    expect(run).toHaveBeenCalledExactlyOnceWith(workspace.realRootPath, args, undefined, undefined);
+    expect(enter).not.toHaveBeenCalled();
+
+    await expect(service.run(actor, {
+      args: ['worktree', 'add', 'other'],
+      workspaceId: workspace.id,
+      userConfirmed: true,
+    })).resolves.toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    expect(enter).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledOnce();
   });
 
   it.each([

@@ -29,6 +29,27 @@ describe('Windows service interrupted restart contract', () => {
 
 describe('Windows service start diagnostics remain fail-closed', () => {
   it.each([
+    { label: 'exact zero-active attempt', identity: binding, activeProcesses: 0, closesWatcher: false },
+    { label: 'foreign attempt', identity: { ...binding, attemptId: 'other-attempt' }, activeProcesses: 0, closesWatcher: true },
+    { label: 'active descendants', identity: binding, activeProcesses: 1, closesWatcher: true },
+  ])('never accepts a held terminal receipt and handles watcher lifetime for $label', async ({ identity, activeProcesses, closesWatcher }) => {
+    const client: WindowsContainmentServiceClient = {
+      async request<T>(request): Promise<T> {
+        if (request.command === 'prepare') return { phase: 0, identity: binding, reservationHeld: true } as T;
+        return { identity, phase: 4, outcome: 0, exitCode: 0, activeProcesses, reservationHeld: true } as T;
+      },
+      async startWatcher(): Promise<void> {},
+    };
+    const authority = new WindowsNativeAuthority(configuration, client);
+    const launch = await authority.prepare({ directory: path.resolve('attempt'), binding,
+      executable: path.resolve('task.exe'), args: [], cwd: path.resolve('workspace'), timeoutMs: 1000 });
+    const end = vi.fn();
+    const child = { stdin: { end } } as unknown as ChildProcess;
+    expect(await launch.connect(child)).toMatchObject({ state: 'termination_unknown', binding });
+    expect(end).toHaveBeenCalledTimes(closesWatcher ? 1 : 0);
+  });
+
+  it.each([
     { message: 'PIPE_LAUNCH_SESSION_UNVERIFIED', reason: 'PIPE_LAUNCH_SESSION_UNVERIFIED' },
     { message: 'SERVICE_OWNER_MISMATCH', reason: 'SERVICE_OWNER_MISMATCH' },
     { message: 'C:\\Users\\secret\\private-file.txt', reason: 'NATIVE_SERVICE_START_UNRESOLVED' },

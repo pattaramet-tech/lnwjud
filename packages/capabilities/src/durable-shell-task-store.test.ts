@@ -3,9 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShellCapabilityBackend as BaseShellCapabilityBackend, type ShellCapabilityOptions } from './shell-backend.js';
-import { DurableShellTaskStore as BaseDurableShellTaskStore, durableShellRequestDigest, parsePosixProcessProbe } from './durable-shell-task-store.js';
+import { DurableShellTaskStore as BaseDurableShellTaskStore, durableShellNativeBinding, durableShellRequestDigest, parsePosixProcessProbe } from './durable-shell-task-store.js';
 import { nativeFixture } from '../../process/test/native-fixture.js';
-import type { WindowsNativeAuthority } from '@lnwjud/process';
+import { WindowsNativeAuthority } from '@lnwjud/process';
 import type { InvocationAuthorization } from '@lnwjud/domain';
 import { CAPABILITY_TASK_OWNER_METADATA_KEY } from './task-ownership.js';
 import { execFile, spawn } from 'node:child_process';
@@ -21,13 +21,6 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 
 const temporaryRoots: string[] = [];
 let nativeAuthority: WindowsNativeAuthority | undefined;
-
-beforeEach(async () => {
-  if (process.platform !== 'win32') return;
-  const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-durable-authority-'));
-  temporaryRoots.push(root);
-  nativeAuthority = (await nativeFixture(root)).authority;
-});
 
 class DurableShellTaskStore extends BaseDurableShellTaskStore {
   constructor(directory: string, options: NonNullable<ConstructorParameters<typeof BaseDurableShellTaskStore>[1]> = {}) {
@@ -60,7 +53,81 @@ afterEach(async () => {
   })));
 }, 30_000);
 
+describe('durable shell native watcher ordering', () => {
+  it.each([false, true])('drains a short-lived native watcher before finalizing its dispatch proof (mismatched: %s)', async (mismatched) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-worker-fast-receipt-'));
+    temporaryRoots.push(root);
+    const state = path.join(root, 'tasks');
+    const runtime = path.join(root, 'test-runtime.mjs');
+    const taskId = randomUUID();
+    const owner = { clientId: 'owner', sessionId: 'session', workspaceId: 'workspace' };
+    const request = {
+      taskId, executable: process.execPath, arguments: [], cwd: root,
+      timeoutSeconds: 15, maxOutputBytes: 1024, includeStdout: true, includeStderr: true, owner,
+    };
+    const binding = durableShellNativeBinding(request);
+    const receiptBinding = mismatched ? { ...binding, ownerSessionId: 'other-session' } : binding;
+    const processReceipt = { state: 'terminal_verified', binding: receiptBinding, outcome: 'completed', exitCode: 0, activeProcesses: 0 };
+    await writeFile(runtime, `
+      export function createWindowsNativeAuthority() {
+        return {
+          async prepare() {
+            return {
+              executable: process.execPath,
+              args: ['-e', "process.stdin.once('data', () => { process.stdout.write('short stdout'); process.stderr.write('short stderr'); });"],
+              environment: process.env,
+              async connect(child) {
+                setTimeout(() => child.stdin.end('forward output'), 200);
+                return ${JSON.stringify(processReceipt)};
+              },
+            };
+          },
+          async inspect() { return { state: 'termination_unknown', reason: 'NATIVE_SERVICE_PROOF_UNAVAILABLE' }; },
+        };
+      }
+    `);
+    const authority = new WindowsNativeAuthority({
+      helper: { executable: process.execPath, sha256: 'a'.repeat(64), buildId: 'lnwjud-containment-v2' },
+      pin: { modulePath: path.join(root, 'unused-pin.node'), sha256: 'b'.repeat(64) },
+      workerModulePath: runtime,
+    }, {
+      async request<T>(): Promise<T> {
+        return { identity: receiptBinding, phase: 4, outcome: 0, exitCode: 0, activeProcesses: 0, reservationHeld: false } as T;
+      },
+      async startWatcher(): Promise<void> {},
+    });
+    const store = new BaseDurableShellTaskStore(state, { platform: 'win32', windowsNativeAuthority: authority });
+    expect(await store.launch(request)).toMatchObject({ ok: true });
+
+    const metadataPath = path.join(state, taskId, 'task.json');
+    await waitUntil(async () => {
+      const value = JSON.parse(await readFile(metadataPath, 'utf8'));
+      return value.state === 'completed' || value.state === 'termination_unverified';
+    }, 15_000);
+    const metadata = JSON.parse(await readFile(metadataPath, 'utf8'));
+    if (mismatched) {
+      expect(metadata).toMatchObject({ state: 'termination_unverified', exit_code: -1, output_finalized: false });
+      expect(metadata).not.toHaveProperty('finished_at');
+      expect(await store.snapshot(taskId, undefined, owner)).toMatchObject({ ok: true, value: { state: 'termination_unverified' } });
+      expect(await store.admissionDiagnostics()).toMatchObject({ durable_shell_reservations: 1, exclusive_writer_blocked: true });
+    } else {
+      expect(metadata).toMatchObject({ state: 'completed', exit_code: 0, output_finalized: true, containmentBinding: binding });
+      expect(await store.snapshot(taskId, undefined, owner)).toMatchObject({
+        ok: true, value: { state: 'completed', exit_code: 0, stdout: 'short stdout', stderr: 'short stderr' },
+      });
+      expect(await store.admissionDiagnostics()).toMatchObject({ durable_shell_reservations: 0, exclusive_writer_blocked: false });
+    }
+  }, 20_000);
+});
+
 describe('durable shell background tasks', () => {
+  beforeEach(async () => {
+    if (process.platform !== 'win32') return;
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-durable-authority-'));
+    temporaryRoots.push(root);
+    nativeAuthority = (await nativeFixture(root)).authority;
+  });
+
   it('preserves a just-reserved POSIX worker during identity capture but fails closed after grace', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-posix-bootstrap-'));
     temporaryRoots.push(root);
@@ -376,6 +443,36 @@ describe('durable shell background tasks', () => {
     expect(await readFile(marker, 'utf8')).toBe(originalMarker);
     expect(await readdir(directory)).toEqual(originalFiles);
   });
+
+  it.skipIf(process.platform !== 'win32')('verifies short-lived tasks and releases their reservations through the installed Windows service', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-fast-installed-service-'));
+    temporaryRoots.push(root);
+    const state = path.join(root, 'tasks');
+    const store = new DurableShellTaskStore(state);
+    const owner = { clientId: 'fast-owner', sessionId: 'fast-session', workspaceId: 'fast-workspace' };
+
+    for (const exitCode of [0, 7]) {
+      const taskId = randomUUID();
+      const request = {
+        taskId, executable: process.execPath,
+        arguments: ['-e', `process.stdout.write('short stdout'); process.stderr.write('short stderr'); process.exitCode = ${exitCode};`],
+        cwd: root, timeoutSeconds: 15, maxOutputBytes: 1024, includeStdout: true, includeStderr: true, owner,
+      };
+      expect(await store.launch(request)).toMatchObject({ ok: true });
+      expect(await store.wait(taskId, 25, undefined, owner)).toMatchObject({
+        ok: true,
+        value: { state: exitCode === 0 ? 'completed' : 'failed', exit_code: exitCode, stdout: 'short stdout', stderr: 'short stderr' },
+      });
+      const binding = durableShellNativeBinding(request);
+      const metadata = JSON.parse(await readFile(path.join(state, taskId, 'task.json'), 'utf8'));
+      expect(metadata).toMatchObject({ containmentBinding: binding, finished_at: expect.any(String), output_finalized: true });
+      expect(await nativeAuthority!.inspect({ binding })).toEqual({
+        state: 'terminal_verified', binding, outcome: 'completed', exitCode, activeProcesses: 0,
+      });
+      expect(await nativeAuthority!.inspect({ binding: { ...binding, ownerSessionId: 'other-session' } })).toMatchObject({ state: 'termination_unknown' });
+      expect(await store.admissionDiagnostics()).toMatchObject({ durable_shell_reservations: 0, exclusive_writer_blocked: false });
+    }
+  }, 55_000);
 
   it.skipIf(process.platform !== 'win32')('rejects unverifiable native proof after restart and recovers without replay', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-late-native-proof-'));
