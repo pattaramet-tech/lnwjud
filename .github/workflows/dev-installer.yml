@@ -78,6 +78,10 @@ jobs:
           LNWJUD_COSIGN_PATH: cosign
         run: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 
+      - name: Report verified Windows binary checksums
+        shell: pwsh
+        run: Get-Content -LiteralPath 'apps/desktop/dist/installers/SHA256SUMS.txt'
+
       - name: Verify silent current-user setup refuses without extracting application files
         shell: pwsh
         timeout-minutes: 3

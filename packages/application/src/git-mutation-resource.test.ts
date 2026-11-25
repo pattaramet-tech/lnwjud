@@ -60,8 +60,10 @@ it('fences typed Git writes by their real common directory across linked worktre
     } finally {
       vi.unstubAllEnvs();
     }
-    await writeFile(path.join(linked, '.git'), 'malformed metadata\n');
-    await expect(gitMutationResource(linked, ['worktree', 'add', 'not-created'])).resolves.toEqual({ kind: 'unresolved' });
+    const malformed = path.join(root, 'malformed worktree');
+    await mkdir(malformed);
+    await writeFile(path.join(malformed, '.git'), 'malformed metadata\n');
+    await expect(gitMutationResource(malformed, ['worktree', 'add', 'not-created'])).resolves.toEqual({ kind: 'unresolved' });
   } finally {
     await rm(root, { recursive: true, force: true, maxRetries: 3 });
   }
