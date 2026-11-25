@@ -301,7 +301,9 @@ export class WindowsNativeAuthority {
     try {
       const value = await this.client.request<unknown>({ protocol: 3, command: 'read_output', identity: binding, outputCursor: requested });
       return parseAttemptOutput(value, binding, requested);
-    } catch { return { state: 'unavailable', binding, reason: 'NATIVE_SERVICE_OUTPUT_UNAVAILABLE' }; }
+    } catch (error: unknown) {
+      return { state: 'unavailable', binding, reason: serviceFailureCode(error, 'NATIVE_SERVICE_OUTPUT_UNAVAILABLE') };
+    }
   }
 
   public async prepare(input: Omit<WindowsContainedLaunchInput, 'authority' | 'binding'> & { readonly binding: NativeAttemptBinding }): Promise<WindowsContainedLaunch> {
@@ -361,10 +363,8 @@ export class WindowsNativeAuthority {
     try {
       validateBinding(input.binding);
       return toObservation(await this.client.request<unknown>({ protocol: 3, command: 'inspect', identity: input.binding }), input.binding);
-    } catch (error) {
-      return unknown(input.binding, error instanceof Error && (error.message === 'SERVICE_ENDPOINT_PACKAGE_MISMATCH'
-        || error.message === 'SERVICE_ENDPOINT_NOT_INSTALLED')
-        ? error.message : 'NATIVE_SERVICE_PROOF_UNAVAILABLE');
+    } catch (error: unknown) {
+      return unknown(input.binding, serviceFailureCode(error, 'NATIVE_SERVICE_PROOF_UNAVAILABLE'));
     }
   }
 
@@ -376,8 +376,8 @@ export class WindowsNativeAuthority {
       return toObservation(await this.client.request<unknown>({
         protocol: 3, command: 'recover_after_reboot', identity: input.binding, recordedAt: input.recordedAt,
       }), input.binding);
-    } catch {
-      return unknown(input.binding, 'NATIVE_RECOVERY_PROOF_UNAVAILABLE');
+    } catch (error: unknown) {
+      return unknown(input.binding, serviceFailureCode(error, 'NATIVE_RECOVERY_PROOF_UNAVAILABLE'));
     }
   }
 
@@ -818,11 +818,12 @@ function toControlObservation(value: unknown, binding: NativeAttemptBinding, com
     || expectedCommit !== undefined && result.commit !== expectedCommit) return unknown(binding, 'NATIVE_SERVICE_CONTROL_PROOF_INVALID');
   return { state: 'control_verified', binding, command, result };
 }
-function safeReason(value: unknown): string | undefined { return typeof value === 'string' && value.length > 0 && value.length <= 128 && [...value].every(character => character.charCodeAt(0) >= 32) ? value : undefined; }
+function safeReason(value: unknown): string | undefined {
+  return typeof value === 'string' && /^(?:SERVICE|PIPE|WRITER|ATTEMPT|NATIVE|TERMINAL|ACTIVE)_[A-Z0-9_]{1,80}$/.test(value)
+    ? value : undefined;
+}
 function serviceFailureCode(error: unknown, fallback: string): string {
-  const message = error instanceof Error ? error.message : undefined;
-  return typeof message === 'string' && /^(?:SERVICE|PIPE|WRITER|ATTEMPT|NATIVE|TERMINAL)_[A-Z0-9_]{1,80}$/.test(message)
-    ? message : fallback;
+  return safeReason(error instanceof Error ? error.message : undefined) ?? fallback;
 }
 function processOperation(input: NativeProcessRequest): NativeServiceProcessOperation {
   if (!path.isAbsolute(input.executable) || !path.isAbsolute(input.cwd)

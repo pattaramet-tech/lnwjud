@@ -29,6 +29,26 @@ describe('Windows service interrupted restart contract', () => {
 
 describe('Windows service start diagnostics remain fail-closed', () => {
   it.each([
+    { message: 'SERVICE_OWNER_MISMATCH', expected: 'SERVICE_OWNER_MISMATCH' },
+    { message: 'C:\\Users\\secret\\private-file.txt', expected: 'NATIVE_SERVICE_PROOF_UNAVAILABLE' },
+    { message: 'SERVICE_' + 'A'.repeat(81), expected: 'NATIVE_SERVICE_PROOF_UNAVAILABLE' },
+  ])('keeps only bounded service diagnostics on inspection', async ({ message, expected }) => {
+    const authority = new WindowsNativeAuthority(configuration, {
+      async request<T>(): Promise<T> { throw new Error(message); },
+      async startWatcher(): Promise<void> {},
+    });
+    expect(await authority.inspect({ binding })).toEqual({ state: 'termination_unknown', binding, reason: expected });
+  });
+
+  it.each([
+    { reason: 'ACTIVE_PROCESSES_REMAIN', expected: 'ACTIVE_PROCESSES_REMAIN' },
+    { reason: 'service lost C:\\Users\\secret\\private-file.txt', expected: 'NATIVE_SERVICE_TERMINATION_UNKNOWN' },
+  ])('sanitizes unverified process reasons without changing the outcome', async ({ reason, expected }) => {
+    const f = fixture({ identity: binding, phase: 5, reason, reservationHeld: true });
+    expect(await f.authority.inspect({ binding })).toEqual({ state: 'termination_unknown', binding, reason: expected });
+  });
+
+  it.each([
     { label: 'exact zero-active attempt', identity: binding, activeProcesses: 0, closesWatcher: false },
     { label: 'foreign attempt', identity: { ...binding, attemptId: 'other-attempt' }, activeProcesses: 0, closesWatcher: true },
     { label: 'active descendants', identity: binding, activeProcesses: 1, closesWatcher: true },

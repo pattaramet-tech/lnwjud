@@ -37,7 +37,7 @@ export {
 } from './agent-policy.js';
 
 export { prohibitedAgentCommandReason, riskyAgentCommandReason } from './agent-command-policy.js';
-export { isProvablyReadOnlyGitInvocation, prohibitedAgentGitInvocationReason } from './git-mutation-policy.js';
+export { isProvablyReadOnlyGitInvocation, prohibitedAgentGitInvocationReason, type GitWriterResource } from './git-mutation-policy.js';
 
 export {
   SECRET_ENVELOPE_PREFIX,

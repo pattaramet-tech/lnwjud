@@ -16,6 +16,10 @@ export interface GitRunner {
   run(args: readonly string[], cwd: string, options?: GitRunOptions): Promise<GitRunResult>;
 }
 
+export const GIT_INSPECTION_OPTIONS = [
+  '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false',
+] as const;
+
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_TIMEOUT_MS = 300_000;
 const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;

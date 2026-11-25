@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { GitRunOptions, GitRunResult, GitRunner } from './git-runner.js';
 import { GitAdapter } from './git-adapter.js';
 
+const READ_OPTIONS = ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false'];
+
 class FakeGitRunner implements GitRunner {
   public readonly calls: { args: readonly string[]; cwd: string; options?: GitRunOptions }[] = [];
   public constructor(private readonly result: GitRunResult) {}
@@ -18,7 +20,7 @@ describe('GitAdapter', () => {
     const result = await new GitAdapter(runner).status('C:\\workspace');
 
     expect(result).toMatchObject({ ok: true, value: { entries: [{ path: 'file.txt', kind: 'modified' }] } });
-    expect(runner.calls).toEqual([{ args: ['status', '--porcelain=v1', '-z', '--untracked-files=all'], cwd: 'C:\\workspace' }]);
+    expect(runner.calls).toEqual([{ args: [...READ_OPTIONS, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], cwd: 'C:\\workspace' }]);
   });
 
   it('enumerates nested untracked files in summary instead of collapsing directory', async () => {
@@ -26,7 +28,7 @@ describe('GitAdapter', () => {
     const result = await new GitAdapter(runner).statusSummary('C:\\workspace');
 
     expect(result).toMatchObject({ ok: true, value: { entries: [{ path: 'artifacts/model.glb', kind: 'untracked' }, { path: 'artifacts/nested/data.xlsx', kind: 'untracked' }] } });
-    expect(runner.calls).toEqual([{ args: ['status', '--porcelain=v1', '-z', '--untracked-files=all'], cwd: 'C:\\workspace' }]);
+    expect(runner.calls).toEqual([{ args: [...READ_OPTIONS, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], cwd: 'C:\\workspace' }]);
   });
 
   it('queries the current branch name', async () => {
@@ -43,7 +45,7 @@ describe('GitAdapter', () => {
 
     expect(result).toEqual({ ok: true, value: { patch: '01234', truncated: true } });
     expect(runner.calls[0]).toEqual({
-      args: ['diff', '--no-ext-diff', '--no-color', '--', 'src\\space file.txt'],
+      args: [...READ_OPTIONS, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--', 'src\\space file.txt'],
       cwd: 'C:\\workspace',
     });
   });

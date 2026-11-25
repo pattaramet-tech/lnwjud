@@ -173,6 +173,23 @@ describe('GitService', () => {
     expect(run).toHaveBeenCalledOnce();
   });
 
+  it('returns typed status and diff reads while a writer blocks admission', async () => {
+    const workspace = await createWorkspace();
+    const actor = { clientId: 'test', clientName: 'test' };
+    const status = vi.fn<GitAdapter['status']>().mockResolvedValue({ ok: true, value: { entries: [] } });
+    const diff = vi.fn<GitAdapter['diff']>().mockResolvedValue({ ok: true, value: { patch: '', truncated: false } });
+    const enter = vi.fn(async () => err(appError('CONFLICT', 'A writer is already active')));
+    const service = new GitService(repository(workspace), undefined, { status, diff } as unknown as GitAdapter, {
+      writerAdmission: { enter },
+    });
+
+    await expect(service.status(actor, workspace.id)).resolves.toEqual({ ok: true, value: { entries: [] } });
+    await expect(service.diff(actor, workspace.id)).resolves.toEqual({ ok: true, value: { patch: '', truncated: false } });
+    expect(status).toHaveBeenCalledExactlyOnceWith(workspace.realRootPath, undefined);
+    expect(diff).toHaveBeenCalledExactlyOnceWith(workspace.realRootPath, {}, undefined);
+    expect(enter).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['global option', ['-C', 'C:\\outside', 'status']],
     ['repository mutation', ['init']],

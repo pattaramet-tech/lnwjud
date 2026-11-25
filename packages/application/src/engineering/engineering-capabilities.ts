@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import type { EngineeringArtifactRole, EngineeringCapabilityFacts, EngineeringFact } from '@lnwjud/domain';
+import { GIT_INSPECTION_OPTIONS } from '@lnwjud/git';
 
 const MAX_FILES = 4096;
 const MAX_BYTES = 64 * 1024 * 1024;
@@ -16,7 +17,7 @@ function failure(error: unknown): EngineeringFact<never> {
   return { state: 'unreadable', reasonCode: error instanceof Error && error.message === 'SOURCE_UNSTABLE' ? 'SOURCE_UNSTABLE' : 'BOUNDED_READ_FAILED' };
 }
 async function git(root: string, args: readonly string[]): Promise<string> {
-  return new Promise((resolve, reject) => execFile('git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-C', root, ...args], { timeout: 3000, maxBuffer: 1024 * 1024, windowsHide: true, encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout)));
+  return new Promise((resolve, reject) => execFile('git', [...GIT_INSPECTION_OPTIONS, '-C', root, ...args], { timeout: 3000, maxBuffer: 1024 * 1024, windowsHide: true, encoding: 'utf8' }, (error, stdout) => error ? reject(error) : resolve(stdout)));
 }
 async function boundedFile(root: string, relative: string, limit = 256 * 1024): Promise<EngineeringFact<string>> {
   try {

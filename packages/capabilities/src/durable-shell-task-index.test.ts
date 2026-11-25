@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DurableShellTaskIndex } from './durable-shell-task-index.js';
+import { DurableShellTaskIndex, type DurableTaskReservation } from './durable-shell-task-index.js';
 
 const temporaryRoots: string[] = [];
 
@@ -313,6 +313,47 @@ describe('DurableShellTaskIndex', () => {
     expect(await index.hasReservation('native-writer', 'a'.repeat(64))).toBe(true);
   });
 
+  it('waits for the exact native reservation proof even if a task projection is terminal', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-index-task-bound-proof-'));
+    temporaryRoots.push(root);
+    const taskId = 'native-shell';
+    const requestDigest = 'a'.repeat(64);
+    const nativeBinding = {
+      taskId, reservationId: taskId, attemptId: 'attempt-1', generation: 1, requestDigest,
+      ownerClientId: 'client', ownerSessionId: 'session', workspaceId: 'workspace',
+    };
+    const nativeReceiptPath = path.join(root, taskId, 'containment.receipt.json');
+    let receiptArrivesWithInspection = false;
+    let receiptAvailable = false;
+    const verifyContainedTermination = vi.fn(async (): Promise<boolean> => receiptAvailable);
+    const index = new DurableShellTaskIndex(root, {
+      maxConcurrentTasks: 10,
+      inspectTask: async (): Promise<'terminal'> => {
+        if (receiptArrivesWithInspection) receiptAvailable = true;
+        return 'terminal';
+      },
+      verifyContainedTermination,
+    });
+    expect(await index.reserve({
+      taskId, requestDigest, nativeBinding, nativeReceiptPath, ownerClientId: 'client', ownerWorkspaceId: 'workspace',
+    })).toMatchObject({ ok: true });
+
+    const probe = {
+      taskId: 'other-workspace-import', requestDigest: 'b'.repeat(64), ownerClientId: 'other-client',
+      ownerWorkspaceId: 'other-workspace', mutationKind: 'repository_import' as const,
+    };
+    expect(await index.reserve(probe)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    expect(await index.hasReservation(taskId, requestDigest)).toBe(true);
+
+    receiptArrivesWithInspection = true;
+    expect(await index.reserve(probe)).toMatchObject({ ok: true, value: { created: true } });
+    expect(verifyContainedTermination).toHaveBeenLastCalledWith(expect.objectContaining({ taskId, requestDigest, nativeBinding, nativeReceiptPath }));
+    expect(await index.hasReservation(taskId, requestDigest)).toBe(false);
+    expect(await index.reserve(probe)).toMatchObject({ ok: true, value: { created: false } });
+    await index.release(probe.taskId, probe.requestDigest);
+    expect(await index.diagnostics()).toMatchObject({ unresolved_reservations: 0 });
+  });
+
   it('does not allow a different client or workspace to attach to another import reservation', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-import-owner-'));
     temporaryRoots.push(root);
@@ -326,6 +367,53 @@ describe('DurableShellTaskIndex', () => {
     expect(await index.reserve(owned)).toMatchObject({ ok: true, value: { created: false } });
     expect(await index.reserve({ ...owned, ownerClientId: 'other-client' })).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
     expect(await index.reserve({ ...owned, ownerWorkspaceId: 'other-workspace' })).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+  });
+
+  it('serializes matching Git resources across workspaces until their exact native proof is verified', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-git-resource-admission-'));
+    temporaryRoots.push(root);
+    const scoped = (taskId: string, workspaceId: string, gitResource: 'same' | 'different' | 'unknown'): DurableTaskReservation => {
+      const requestDigest = createHash('sha256').update(taskId).digest('hex');
+      return {
+        taskId, requestDigest, ownerClientId: taskId, ownerWorkspaceId: workspaceId,
+        mutationKind: 'opaque_contained_process' as const,
+        nativeReceiptPath: path.join(root, taskId, 'containment.receipt.json'),
+        nativeBinding: {
+          taskId, reservationId: taskId, attemptId: `${taskId}-attempt`, generation: 1, requestDigest,
+          ownerClientId: taskId, ownerSessionId: `${taskId}-session`, workspaceId,
+        },
+        gitResource: gitResource === 'unknown' ? { kind: 'unresolved' as const }
+          : { kind: 'common-directory' as const, digest: createHash('sha256').update(gitResource).digest('hex') },
+      };
+    };
+    const first = scoped('first', 'main-worktree', 'same');
+    const linked = scoped('linked', 'linked-worktree', 'same');
+    const different = scoped('independent', 'independent-repo', 'different');
+    const unresolved = scoped('unresolved', 'another-workspace', 'unknown');
+    const verified = new Set<string>();
+    const options = {
+      maxConcurrentTasks: 8,
+      inspectTask: async (): Promise<'unknown'> => 'unknown',
+      verifyContainedTermination: async ({ taskId }: { taskId: string }): Promise<boolean> => verified.has(taskId),
+    };
+    const initial = new DurableShellTaskIndex(root, options);
+    expect(await initial.reserve(first)).toMatchObject({ ok: true });
+    const reopened = new DurableShellTaskIndex(root, options);
+    expect(await reopened.reserve(linked)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    expect(await reopened.reserve(unresolved)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    expect(await reopened.reserve(different)).toMatchObject({ ok: true });
+    expect(await reopened.reserve({ ...first, gitResource: different.gitResource! })).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    await reopened.release(first.taskId, first.requestDigest);
+    expect(await reopened.hasReservation(first.taskId, first.requestDigest)).toBe(true);
+
+    verified.add(first.taskId);
+    expect(await reopened.reserve(linked)).toMatchObject({ ok: true });
+    expect(await reopened.hasReservation(first.taskId, first.requestDigest)).toBe(false);
+    expect(await reopened.hasReservation(different.taskId, different.requestDigest)).toBe(true);
+    verified.add(linked.taskId);
+    verified.add(different.taskId);
+    expect(await reopened.reserve(unresolved)).toMatchObject({ ok: true });
+    expect(await reopened.reserve(scoped('next', 'main-worktree', 'same'))).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
   });
 
   it('refuses to adopt a native reservation with changed receipt or attempt identity', async () => {

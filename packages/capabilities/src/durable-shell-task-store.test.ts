@@ -8,6 +8,7 @@ import { nativeFixture } from '../../process/test/native-fixture.js';
 import { WindowsNativeAuthority } from '@lnwjud/process';
 import type { InvocationAuthorization } from '@lnwjud/domain';
 import { CAPABILITY_TASK_OWNER_METADATA_KEY } from './task-ownership.js';
+import { DurableShellTaskIndex } from './durable-shell-task-index.js';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { promisify } from 'node:util';
@@ -117,6 +118,81 @@ describe('durable shell native watcher ordering', () => {
       });
       expect(await store.admissionDiagnostics()).toMatchObject({ durable_shell_reservations: 0, exclusive_writer_blocked: false });
     }
+  }, 20_000);
+
+  it('reattaches after a dead coordinator and recovers late service output without replaying or rewriting local logs', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-native-output-recovery-'));
+    temporaryRoots.push(root);
+    const taskId = randomUUID();
+    const directory = path.join(root, taskId);
+    const metadataFile = path.join(directory, 'task.json');
+    const stdoutFile = path.join(directory, 'stdout.log');
+    const owner = { clientId: 'owner', sessionId: 'initial-session', workspaceId: 'workspace' };
+    const request = { taskId, executable: process.execPath, arguments: [], cwd: root,
+      timeoutSeconds: 15, maxOutputBytes: 1024, includeStdout: true, includeStderr: true, owner };
+    const binding = durableShellNativeBinding(request);
+    const timestamp = new Date(10_000).toISOString();
+    const index = new DurableShellTaskIndex(root, { maxConcurrentTasks: 16, inspectTask: async (): Promise<'unknown'> => 'unknown' });
+    expect(await index.reserve({ taskId, requestDigest: binding.requestDigest, mutationKind: 'opaque',
+      ownerClientId: owner.clientId, ownerWorkspaceId: owner.workspaceId, nativeBinding: binding,
+      nativeReceiptPath: path.join(directory, 'containment.receipt.json') })).toMatchObject({ ok: true });
+    await mkdir(directory);
+    await writeFile(metadataFile, JSON.stringify({ version: 2, task_id: taskId, containment: 'windows_job_v2',
+      containmentBinding: binding, request_digest: binding.requestDigest, state: 'termination_unverified',
+      owner_client_id: owner.clientId, owner_session_id: owner.sessionId, owner_workspace_id: owner.workspaceId,
+      started_at: timestamp, deadline_at: timestamp, include_stdout: true, include_stderr: true, max_output_bytes: 1024,
+      worker_pid: 2_147_483_647, worker_started_at: timestamp, output_finalized: false }));
+    await writeFile(stdoutFile, 'partial');
+    let terminal = false;
+    let outputBinding = { ...binding, ownerSessionId: 'foreign-attempt' };
+    const commands: string[] = [];
+    const stdout = Buffer.from('complete\noutput');
+    const stderr = Buffer.from('stderr');
+    const cursor = { stdoutOffset: stdout.length, stderrOffset: stderr.length };
+    const authority = new WindowsNativeAuthority({
+      helper: { executable: process.execPath, sha256: 'a'.repeat(64), buildId: 'lnwjud-containment-v2' },
+      pin: { modulePath: path.join(root, 'unused-pin.node'), sha256: 'b'.repeat(64) },
+    }, {
+      async request<T>(input: { command: string }): Promise<T> {
+        commands.push(input.command);
+        if (input.command === 'read_output') {
+          return { identity: outputBinding, stdoutBase64: stdout.toString('base64'), stderrBase64: stderr.toString('base64'),
+            stdoutTruncated: false, stderrTruncated: false, persisted: true, persistenceStatus: 'persisted',
+            complete: true, nextCursor: cursor, finalCursor: cursor, incompleteReason: null } as T;
+        }
+        return (terminal && input.command === 'inspect'
+          ? { identity: binding, phase: 4, outcome: 0, exitCode: 0, activeProcesses: 0, reservationHeld: false }
+          : { identity: binding, phase: 5, reason: 'SERVICE_RESTART_REQUIRES_RECONCILIATION', reservationHeld: true }) as T;
+      },
+      async startWatcher(): Promise<void> {},
+    });
+    const before = new BaseDurableShellTaskStore(root, { windowsNativeAuthority: authority });
+    expect(await before.snapshot(taskId, undefined, owner)).toMatchObject({ ok: true, value: { state: 'termination_unverified' } });
+    expect(await before.admissionDiagnostics()).toMatchObject({ durable_shell_reservations: 1, exclusive_writer_blocked: true });
+
+    terminal = true;
+    const reconnected = { ...owner, sessionId: 'replacement-session' };
+    const after = new BaseDurableShellTaskStore(root, { windowsNativeAuthority: authority });
+    const liveness = await after.snapshotForGoalLiveness(taskId, owner.workspaceId);
+    expect(liveness).toMatchObject({ ok: true, value: { state: 'completed', exit_code: 0 } });
+    if (liveness.ok) expect(liveness.value).not.toHaveProperty('stdout');
+    expect(commands).not.toContain('read_output');
+    expect(await after.admissionDiagnostics()).toMatchObject({ durable_shell_reservations: 0, exclusive_writer_blocked: false });
+    const settledMetadata = await readFile(metadataFile, 'utf8');
+
+    expect(await after.snapshot(taskId, undefined, reconnected)).toMatchObject({ ok: true, value: { stdout: 'partial', truncated: true } });
+    expect(await after.snapshotForGoalEvidence(taskId, owner.workspaceId)).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+    outputBinding = binding;
+    const [recovered, duplicate] = await Promise.all([after.snapshot(taskId, 1, reconnected), after.launch(request)]);
+    expect(recovered).toMatchObject({ ok: true, value: { stdout: 'output', stderr: 'stderr', truncated: false } });
+    expect(duplicate).toMatchObject({ ok: true, value: { state: 'completed', stdout: 'complete\noutput', truncated: false } });
+    expect(await after.snapshotForGoalEvidence(taskId, owner.workspaceId)).toMatchObject({ ok: true, value: { stdout: 'complete\noutput' } });
+    expect(await after.snapshot(taskId, undefined, { ...reconnected, clientId: 'foreign-client' })).toMatchObject({ ok: false, error: { code: 'PERMISSION_DENIED' } });
+    expect(await after.snapshot(taskId, undefined, { ...owner, sessionId: 'http-new-session' })).toMatchObject({ ok: false, error: { code: 'PERMISSION_DENIED' } });
+    expect(commands).not.toContain('prepare');
+    expect(commands).not.toContain('run');
+    expect(await readFile(stdoutFile, 'utf8')).toBe('partial');
+    expect(await readFile(metadataFile, 'utf8')).toBe(settledMetadata);
   }, 20_000);
 });
 

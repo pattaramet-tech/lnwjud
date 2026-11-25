@@ -25,6 +25,7 @@ import { WorkspacePathGuard, type Workspace, type WorkspaceRepository } from '@l
 import { isProvablyReadOnlyGitInvocation, prohibitedAgentGitInvocationReason } from '@lnwjud/shared';
 import type { FileActor } from './file-service.js';
 import { isAbsoluteFsPath, resolveWorkspaceForPath } from './workspace-locator.js';
+import { gitMutationResource } from './git-mutation-resource.js';
 
 export interface GitRunRequest {
   readonly args: readonly string[];
@@ -129,15 +130,25 @@ export class GitService {
     const containmentId = randomUUID();
     const nativeRoot = this.writerOptions.nativeContainmentRoot;
     const receiptPath = process.platform === 'win32' && nativeRoot !== undefined ? path.join(nativeRoot, containmentId, 'containment.receipt.json') : undefined;
+    const gitResource = await gitMutationResource(cwd, request.args);
     const admission = await this.writerOptions.writerAdmission!.enter({
       actorClientId: actor.clientId,
       actorSessionId: actor.sessionId?.trim() || actor.clientId,
       nativeTaskId: containmentId,
       workspaceId: request.workspaceId ?? 'unscoped-git',
       kind: receiptPath === undefined ? 'uncontained_process' : 'contained_process',
+      gitResource,
       ...(receiptPath === undefined ? {} : { nativeReceiptPath: receiptPath }),
     });
     if (!admission.ok) return admission;
+    if (gitResource.kind === 'common-directory') {
+      const current = await gitMutationResource(cwd, request.args);
+      if (current.kind !== 'common-directory' || current.digest !== gitResource.digest) {
+        try { await admission.value.abortBeforeLaunch?.(); }
+        catch { return err(appError('CONFLICT', 'Git resource changed before launch and reservation release is unverified', true)); }
+        return err(appError('CONFLICT', 'Git resource changed before launch', true));
+      }
+    }
     // Only a zero-active native Windows Job receipt authorizes release.
     const manager = this.writerOptions.processManager ?? new ProcessManager(undefined, undefined, undefined, undefined, nativeRoot, this.writerOptions.nativeAuthority);
     const started = await manager.start({

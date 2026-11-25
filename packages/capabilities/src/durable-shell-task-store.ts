@@ -2,7 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import { mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { inspectPosixProcessGroup, PosixProcessTree, parseNativeAttemptBinding, type PosixProcessGroupInspector, type NativeAttemptBinding, type MacosNativeAuthority, type WindowsNativeAuthority, type WindowsNativeAuthorityConfiguration } from '@lnwjud/process';
+import { inspectPosixProcessGroup, PosixProcessTree, parseNativeAttemptBinding, type PosixProcessGroupInspector, type NativeAttemptBinding, type NativeOutputRead, type MacosNativeAuthority, type WindowsNativeAuthority, type WindowsNativeAuthorityConfiguration } from '@lnwjud/process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { appError, err, ok, type GoalTaskCancellationObservation, type Result } from '@lnwjud/domain';
@@ -471,8 +471,23 @@ export class DurableShellTaskStore {
     if (projection.kind === 'legacy_unverified') return err(appError('INVALID_INPUT', projection.reason));
     const reconciled = projection.metadata;
     await this.releaseTerminalReservation(reconciled);
-    if (reconciled.state !== 'completed' || reconciled.exit_code !== 0 || !reconciled.include_stdout || reconciled.stdout_truncated === true
-      || (isNativeManagedContainment(reconciled) && reconciled.output_finalized !== true)) {
+    if (reconciled.state !== 'completed' || reconciled.exit_code !== 0 || !reconciled.include_stdout) {
+      return err(appError('INVALID_INPUT', 'Engineering evidence requires complete stdout from a successful terminal task'));
+    }
+    if (isNativeManagedContainment(reconciled) && reconciled.output_finalized !== true) {
+      const recovered = await this.readWindowsTerminalOutput(reconciled);
+      if (recovered === undefined || recovered.stdoutTruncated || recovered.stdout.length === 0
+        || recovered.stdout.length > Math.min(MAX_GOAL_EVIDENCE_STDOUT_BYTES, boundedTaskOutputBytes(reconciled.max_output_bytes))) {
+        return err(appError('INVALID_INPUT', 'Engineering evidence requires complete stdout from a successful terminal task'));
+      }
+      return ok({
+        ...await this.snapshotFromMetadata(reconciled, undefined, false),
+        stdout: recovered.stdout.toString('utf8'),
+        truncated: recovered.stderrTruncated || recovered.stderr.length > boundedTaskOutputBytes(reconciled.max_output_bytes),
+        ...(reconciled.command_fingerprint === undefined ? {} : { command_fingerprint: reconciled.command_fingerprint }),
+      });
+    }
+    if (reconciled.stdout_truncated === true) {
       return err(appError('INVALID_INPUT', 'Engineering evidence requires complete stdout from a successful terminal task'));
     }
     const filename = path.join(this.taskDirectory(taskId), STDOUT_FILENAME);
@@ -904,9 +919,11 @@ export class DurableShellTaskStore {
   private async reconcileNative(metadata: DurableTaskMetadata): Promise<DurableTaskMetadata> {
     const binding = metadata.containmentBinding;
     const authority = this.windowsNativeAuthority;
-    const unknown = (): DurableTaskMetadata => {
-      const unresolved = { ...metadata, state: 'termination_unverified' as const, error: 'Authenticated native termination proof is unavailable' };
+    const unknown = (reason?: string): DurableTaskMetadata => {
+      const unresolved = { ...metadata, state: 'termination_unverified' as const,
+        error: reason ?? 'Authenticated native termination proof is unavailable' };
       delete unresolved.finished_at;
+      delete unresolved.exit_code;
       return unresolved;
     };
     if (authority === undefined || binding === undefined || !nativeBindingMatchesMetadata(metadata, binding)) return unknown();
@@ -936,7 +953,7 @@ export class DurableShellTaskStore {
         }
       }
     }
-    if (proof.state === 'termination_unknown') return isTerminal(metadata.state) ? unknown() : metadata;
+    if (proof.state === 'termination_unknown') return isTerminal(metadata.state) ? unknown(proof.reason) : metadata;
     const expectedState = proof.state === 'launch_not_started' ? 'failed' : nativeOutcomeState(proof.outcome, proof.exitCode);
     const expectedExitCode = proof.state === 'launch_not_started' ? -1 : proof.exitCode;
     if (metadata.state === expectedState && metadata.exit_code === expectedExitCode && metadata.finished_at !== undefined) return metadata;
@@ -1023,21 +1040,41 @@ export class DurableShellTaskStore {
     }
   }
 
+  private async readWindowsTerminalOutput(metadata: DurableTaskMetadata): Promise<Extract<NativeOutputRead, { state: 'available' }> | undefined> {
+    const binding = metadata.containmentBinding;
+    if (metadata.containment !== 'windows_job_v2' || !isTerminal(metadata.state) || metadata.output_finalized === true
+      || this.windowsNativeAuthority === undefined || binding === undefined || !nativeBindingMatchesMetadata(metadata, binding)) return undefined;
+    // A dead coordinator can leave local output incomplete even though the
+    // authenticated Windows service durably retained the final byte cursors.
+    const output = await this.windowsNativeAuthority.attachProcess(binding).readOutput({ stdoutOffset: 0, stderrOffset: 0 });
+    return output.state === 'available' && output.complete && output.persistence.state === 'persisted' && output.finalCursor !== null
+      && nativeBindingMatchesMetadata(metadata, output.binding) ? output : undefined;
+  }
+
   private async snapshotFromMetadata(metadata: DurableTaskMetadata, tailLines?: number, includeOutput = true): Promise<Record<string, unknown>> {
     const taskDirectory = this.taskDirectory(metadata.task_id);
-    let stdout = includeOutput && metadata.include_stdout ? await readBoundedText(path.join(taskDirectory, STDOUT_FILENAME), metadata.max_output_bytes, tailLines) : undefined;
-    let stderr = includeOutput && metadata.include_stderr ? await readBoundedText(path.join(taskDirectory, STDERR_FILENAME), metadata.max_output_bytes, tailLines) : undefined;
+    const recoveredOutput = includeOutput && (metadata.include_stdout || metadata.include_stderr)
+      ? await this.readWindowsTerminalOutput(metadata) : undefined;
+    let stdout = includeOutput && metadata.include_stdout ? recoveredOutput === undefined
+      ? await readBoundedText(path.join(taskDirectory, STDOUT_FILENAME), metadata.max_output_bytes, tailLines)
+      : renderTaskOutput(recoveredOutput.stdout, metadata.max_output_bytes, tailLines) : undefined;
+    let stderr = includeOutput && metadata.include_stderr ? recoveredOutput === undefined
+      ? await readBoundedText(path.join(taskDirectory, STDERR_FILENAME), metadata.max_output_bytes, tailLines)
+      : renderTaskOutput(recoveredOutput.stderr, metadata.max_output_bytes, tailLines) : undefined;
     if (includeOutput && metadata.containment === 'macos_endpoint_security_v1' && metadata.containmentBinding !== undefined) {
       const output = await this.macosNativeAuthority?.attachProcess(metadata.containmentBinding).readOutput({ stdoutOffset: 0, stderrOffset: 0 });
       if (output?.state === 'available') {
-        const text = (bytes: Buffer): string => {
-          const value = bytes.subarray(0, metadata.max_output_bytes).toString('utf8');
-          return tailLines === undefined ? value : value.split(/\r?\n/).slice(-tailLines).join('\n');
-        };
-        if (metadata.include_stdout) stdout = text(output.stdout);
-        if (metadata.include_stderr) stderr = text(output.stderr);
+        if (metadata.include_stdout) stdout = renderTaskOutput(output.stdout, metadata.max_output_bytes, tailLines);
+        if (metadata.include_stderr) stderr = renderTaskOutput(output.stderr, metadata.max_output_bytes, tailLines);
       }
     }
+    const boundedBytes = boundedTaskOutputBytes(metadata.max_output_bytes);
+    const truncated = recoveredOutput === undefined
+      ? metadata.stdout_truncated === true || metadata.stderr_truncated === true
+        || (includeOutput && (metadata.include_stdout || metadata.include_stderr) && metadata.containment === 'windows_job_v2'
+          && isTerminal(metadata.state) && metadata.output_finalized !== true)
+      : recoveredOutput.stdoutTruncated || recoveredOutput.stderrTruncated
+        || recoveredOutput.stdout.length > boundedBytes || recoveredOutput.stderr.length > boundedBytes;
     return {
       task_id: metadata.task_id,
       state: metadata.state,
@@ -1053,7 +1090,7 @@ export class DurableShellTaskStore {
       ...(metadata.worker_started_at === undefined ? {} : { worker_started_at: metadata.worker_started_at }),
       ...(metadata.child_pid === undefined ? {} : { child_pid: metadata.child_pid }),
       ...(metadata.child_started_at === undefined ? {} : { child_started_at: metadata.child_started_at }),
-      truncated: metadata.stdout_truncated === true || metadata.stderr_truncated === true,
+      truncated,
     };
   }
 
@@ -1250,10 +1287,19 @@ function isTerminalValue(value: unknown): value is DurableShellTaskState {
   return typeof value === 'string' && isTerminal(value as DurableShellTaskState);
 }
 
-async function readBoundedText(filename: string, maxBytes: number, tailLines?: number): Promise<string> {
-  const boundedBytes = Number.isFinite(maxBytes)
+function boundedTaskOutputBytes(maxBytes: number): number {
+  return Number.isFinite(maxBytes)
     ? Math.max(0, Math.min(Math.floor(maxBytes), 8 * 1024 * 1024))
     : 0;
+}
+
+function renderTaskOutput(bytes: Buffer, maxBytes: number, tailLines?: number): string {
+  const value = bytes.subarray(0, boundedTaskOutputBytes(maxBytes)).toString('utf8');
+  return tailLines === undefined ? value : value.split(/\r?\n/).slice(-tailLines).join('\n');
+}
+
+async function readBoundedText(filename: string, maxBytes: number, tailLines?: number): Promise<string> {
+  const boundedBytes = boundedTaskOutputBytes(maxBytes);
   if (boundedBytes === 0) return '';
   let value = '';
   let handle: Awaited<ReturnType<typeof open>> | undefined;
@@ -1877,7 +1923,11 @@ try {
   await runWorker();
 } catch (error) {
   if (nativeConnectionStarted) child?.stdin?.destroy();
-  await finish('failed', -1, 'Local task failed to start: ' + (error instanceof Error ? error.message : String(error)));
+  const reason = error instanceof Error ? error.message : String(error);
+  const diagnostic = spec.native
+    ? (/^(?:SERVICE|PIPE|WRITER|ATTEMPT|NATIVE|TERMINAL|ACTIVE)_[A-Z0-9_]{1,80}$/.test(reason) ? reason : 'NATIVE_WORKER_START_UNRESOLVED')
+    : 'Local task failed to start: ' + reason;
+  await finish('failed', -1, diagnostic);
 }
 `;
 

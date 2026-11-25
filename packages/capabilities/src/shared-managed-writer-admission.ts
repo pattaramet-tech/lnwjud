@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { appError, err, ok, type Result } from '@lnwjud/domain';
 import { parseNativeAttemptBinding, type NativeAttemptBinding, type WindowsNativeAuthority } from '@lnwjud/process';
+import type { GitWriterResource } from '@lnwjud/shared';
 import { DurableShellTaskIndex, type DurableTaskReservation } from './durable-shell-task-index.js';
 import { DurableShellTaskStore } from './durable-shell-task-store.js';
 
@@ -71,6 +72,7 @@ export class SharedManagedWriterAdmission {
     readonly workspaceId: string;
     readonly kind: WriterContainmentKind;
     readonly nativeReceiptPath?: string;
+    readonly gitResource?: GitWriterResource;
   }): Promise<Result<ManagedWriterAdmissionLease>> {
     if (!input.actorClientId || !input.workspaceId
       || (input.kind !== 'synchronous_mutation' && input.kind !== 'uncontained_process' && input.kind !== 'contained_process')) {
@@ -82,7 +84,7 @@ export class SharedManagedWriterAdmission {
       return err(appError('CONFLICT', 'macOS process writer requires an enrolled Endpoint Security owner; no reservation was created'));
     }
     const id = 'managed-writer-' + randomUUID();
-    const digest = createHash('sha256').update(JSON.stringify([id, input.actorClientId, input.actorSessionId, input.workspaceId])).digest('hex');
+    const digest = createHash('sha256').update(JSON.stringify([id, input.actorClientId, input.actorSessionId, input.workspaceId, input.gitResource])).digest('hex');
     const nativeBinding = input.kind === 'contained_process' ? parseNativeAttemptBinding({
       taskId: input.nativeTaskId, reservationId: id, attemptId: randomUUID(), generation: 1,
       requestDigest: digest, ownerClientId: input.actorClientId, ownerSessionId: input.actorSessionId,
@@ -113,6 +115,7 @@ export class SharedManagedWriterAdmission {
         : input.kind === 'uncontained_process' ? 'opaque_uncontained' : 'opaque_contained_process',
       ...(input.nativeReceiptPath === undefined ? {} : { nativeReceiptPath: input.nativeReceiptPath }),
       ...(nativeBinding === undefined ? {} : { nativeBinding }),
+      ...(input.gitResource === undefined ? {} : { gitResource: input.gitResource }),
       ownerClientId: input.actorClientId,
       ownerWorkspaceId: input.workspaceId,
     });

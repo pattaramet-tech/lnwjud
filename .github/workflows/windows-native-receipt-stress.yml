@@ -1,0 +1,79 @@
+name: Windows Native Receipt Stress
+
+on:
+  push:
+    branches: [fix/native-terminal-receipt-lifecycle]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-native-receipt-stress-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stress:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Setup .NET 8 containment compiler
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup pnpm 10.15.0
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.15.0
+          run_install: false
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare trusted containment runtime
+        run: pnpm prepare:containment
+
+      - name: Provision real protected Windows containment service
+        shell: pwsh
+        run: ./scripts/prepare-windows-containment-ci.ps1
+
+      - name: Build workspace packages
+        run: pnpm typecheck
+
+      - name: Verify native service crash, restart and receipt boundaries
+        run: dotnet run --project native/windows-containment-helper/tests/ContainmentNativeTests.csproj -c Release
+
+      - name: Verify native receipt and writer admission regressions
+        shell: bash
+        run: >-
+          pnpm exec vitest run --fileParallelism=false
+          packages/capabilities/src/durable-shell-task-store.test.ts
+          packages/capabilities/src/durable-shell-task-index.test.ts
+          packages/capabilities/src/workspace-writer-admission-recovery.test.ts
+          packages/capabilities/src/workspace-writer-lease.test.ts
+          packages/capabilities/src/shell-backend.test.ts
+          packages/application/src/git-mutation-resource.test.ts
+          packages/application/src/git-service.test.ts
+          packages/git/src/git-adapter.test.ts
+          packages/process/src/windows-native-authority-service.test.ts
+          tests/integration/process-writer-admission.test.ts
+
+      - name: Verify independent MCP sessions and workspaces
+        run: pnpm --filter @lnwjud/desktop exec vitest run --config vitest.config.ts --fileParallelism=false tests/multi-workspace-concurrency-acceptance.test.ts
+
+      - name: Verify 1,000 short tasks against the Windows service
+        env:
+          LNWJUD_WINDOWS_DURABLE_STRESS: '1'
+        run: pnpm exec vitest run tests/integration/windows-durable-shell-stress.test.ts --reporter=verbose

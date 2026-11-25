@@ -1,5 +1,6 @@
 import type { Result } from '@lnwjud/domain';
 import type { NativeAttemptBinding } from '@lnwjud/process';
+import type { GitWriterResource } from '@lnwjud/shared';
 
 export interface ManagedWriterAdmissionLease {
   readonly id: string;
@@ -17,5 +18,6 @@ export interface ManagedWriterAdmissionPort {
     readonly workspaceId: string;
     readonly kind: 'synchronous_mutation' | 'uncontained_process' | 'contained_process';
     readonly nativeReceiptPath?: string;
+    readonly gitResource?: GitWriterResource;
   }): Promise<Result<ManagedWriterAdmissionLease>>;
 }

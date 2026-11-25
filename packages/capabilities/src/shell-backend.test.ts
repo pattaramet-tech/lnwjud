@@ -3,9 +3,10 @@ import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { automationShellRequestDigest, ok, type Result } from '@lnwjud/domain';
+import { appError, automationShellRequestDigest, err, ok, type Result } from '@lnwjud/domain';
 import { engineeringCommandFingerprint, formatEngineeringCommand } from '@lnwjud/shared';
 import { ShellCapabilityBackend, withAutomationShellDispatchContext } from './shell-backend.js';
+import { DurableShellTaskStore } from './durable-shell-task-store.js';
 import { CAPABILITY_TASK_OWNER_METADATA_KEY } from './task-ownership.js';
 import { nativeFixture } from '../../process/test/native-fixture.js';
 import { createHostPosixProcessRuntime } from './host-native-authority.js';
@@ -29,6 +30,35 @@ afterEach(async () => {
 });
 
 describe('ShellCapabilityBackend', () => {
+  it.each([
+    ['docker', ['ps', '-a', '--format', '{{.Names}} {{.Image}} {{.Ports}} {{.Status}}']],
+    ['docker', ['version']],
+    ['node', ['--version']],
+    ['pnpm', ['--version']],
+    ['corepack', ['pnpm@10.15.0', '--version']],
+  ] as const)('sends shell %s %j through durable admission', async (executable, args) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-shell-argv-admission-'));
+    temporaryRoots.push(root);
+    const windowsShim = process.platform === 'win32' && (executable === 'pnpm' || executable === 'corepack');
+    const resolved = path.join(root, executable + (windowsShim ? '.cmd' : process.platform === 'win32' ? '.exe' : ''));
+    const backend = new ShellCapabilityBackend({
+      allowedRoots: [root], taskStateDirectory: path.join(root, 'tasks'),
+      executableResolver: { resolve: async (): Promise<Result<string>> => ok(resolved) },
+    });
+    const launch = vi.spyOn(DurableShellTaskStore.prototype, 'launch')
+      .mockResolvedValueOnce(err(appError('CONFLICT', 'A writer is already active')));
+    try {
+      await expect(backend.execute({ executable, arguments: args, cwd: root, execution: 'background' }))
+        .resolves.toMatchObject({ ok: false, error: { code: 'CONFLICT', message: 'A writer is already active' } });
+      expect(launch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        cwd: await realpath(root),
+        ...(windowsShim ? { windowsVerbatimArguments: true } : { executable: resolved, arguments: args }),
+      }));
+    } finally {
+      launch.mockRestore();
+    }
+  });
+
   it('binds in-memory trusted task observations to the launched command', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-shell-evidence-'));
     temporaryRoots.push(root);

@@ -1,5 +1,5 @@
 import { appError, err, ok, type Result } from '@lnwjud/domain';
-import { DirectGitRunner, type GitRunOptions, type GitRunResult, type GitRunner } from './git-runner.js';
+import { DirectGitRunner, GIT_INSPECTION_OPTIONS, type GitRunOptions, type GitRunResult, type GitRunner } from './git-runner.js';
 import { parsePorcelainStatus, type GitStatusEntry } from './parsers/status-parser.js';
 
 export interface GitStatusResult {
@@ -50,7 +50,7 @@ export class GitAdapter {
 
   public async status(cwd: string, signal?: AbortSignal): Promise<Result<GitStatusResult>> {
     const result = await this.runner.run(
-      ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+      [...GIT_INSPECTION_OPTIONS, 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
       cwd,
       this.signalOptions(signal),
     );
@@ -66,7 +66,7 @@ export class GitAdapter {
    */
   public async statusSummary(cwd: string, signal?: AbortSignal): Promise<Result<GitStatusResult>> {
     const result = await this.runner.run(
-      ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+      [...GIT_INSPECTION_OPTIONS, 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
       cwd,
       this.signalOptions(signal),
     );
@@ -93,7 +93,7 @@ export class GitAdapter {
   public async diff(cwd: string, request: GitDiffRequest = {}, signal?: AbortSignal): Promise<Result<GitDiffResult>> {
     const maxBytes = request.maxBytes ?? 1024 * 1024;
     if (!this.isLimit(maxBytes, 4 * 1024 * 1024)) return err(appError('INVALID_INPUT', 'Git diff byte limit is invalid'));
-    const args = ['diff', '--no-ext-diff', '--no-color'];
+    const args = [...GIT_INSPECTION_OPTIONS, 'diff', '--no-ext-diff', '--no-textconv', '--no-color'];
     if (request.staged === true) args.push('--cached');
     args.push('--');
     if (request.path !== undefined) args.push(request.path);

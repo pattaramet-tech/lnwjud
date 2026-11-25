@@ -1,3 +1,6 @@
+/** Host-derived scope for additional serialization of typed Git mutations. */
+export type GitWriterResource = { readonly kind: 'common-directory'; readonly digest: string } | { readonly kind: 'unresolved' };
+
 const ALWAYS_READ_ONLY_GIT_SUBCOMMANDS = new Set([
   'blame', 'cat-file', 'check-attr', 'check-ignore', 'check-mailmap', 'column',
   'count-objects', 'describe', 'diff', 'diff-files', 'diff-index', 'diff-tree',

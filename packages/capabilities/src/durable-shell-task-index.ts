@@ -3,6 +3,7 @@ import { appendFile, lstat, mkdir, open, readFile, readdir, rename, rm, stat, wr
 import path from 'node:path';
 import { parseNativeAttemptBinding, type NativeAttemptBinding } from '@lnwjud/process';
 import { appError, err, ok, type Result } from '@lnwjud/domain';
+import type { GitWriterResource } from '@lnwjud/shared';
 
 export type ActiveTaskInspection = 'active' | 'terminal' | 'missing' | 'unknown';
 
@@ -44,6 +45,8 @@ export interface DurableTaskReservation {
   /** Trusted native proof path; never accepted from MCP caller input. */
   readonly nativeReceiptPath?: string;
   readonly nativeBinding?: NativeAttemptBinding;
+  /** Host-derived resource for typed Git writes only. */
+  readonly gitResource?: GitWriterResource;
   readonly reservedAt?: string;
   readonly launchRecord?: DurableTaskLaunchRecord;
 }
@@ -119,6 +122,8 @@ export class DurableShellTaskIndex {
       || (input.nativeBinding !== undefined && (parseNativeAttemptBinding(input.nativeBinding) === undefined
         || input.nativeBinding.reservationId !== input.taskId || input.nativeBinding.requestDigest !== input.requestDigest
         || input.nativeBinding.ownerClientId !== input.ownerClientId || input.nativeBinding.workspaceId !== input.ownerWorkspaceId))
+      || (input.gitResource !== undefined && (parseGitResource(input.gitResource) === undefined
+        || input.mutationKind !== 'opaque_uncontained' && input.mutationKind !== 'opaque_contained_process'))
       || !isSafeTaskId(input.taskId)
       || !/^[a-f0-9]{64}$/i.test(input.requestDigest)
       || (input.launchRecord !== undefined && (!isLaunchRecord(input.launchRecord) || input.launchRecord.taskId !== input.taskId
@@ -149,6 +154,7 @@ export class DurableShellTaskIndex {
       const bulkNativeBacklog = currentMarkers.length >= 8
         && currentMarkers.some((marker) => marker.record?.mutationKind === 'opaque_contained_process');
       const skipObservation = input.mutationKind !== 'repository_import' && noImport && spareCapacity
+        && (input.gitResource === undefined || !currentMarkers.some((marker) => gitResourcesConflict(input.gitResource, marker.record?.gitResource)))
         && ((input.mutationKind === 'synchronous_mutation' && capacityClass === 'managed_writer')
           || bulkNativeBacklog);
       const observations = skipObservation ? null : await this.observeMarkersOutsideLock(input.taskId);
@@ -173,6 +179,7 @@ export class DurableShellTaskIndex {
               || marker.record.ownerClientId !== input.ownerClientId
               || marker.record.ownerWorkspaceId !== input.ownerWorkspaceId
               || marker.record.nativeReceiptPath !== input.nativeReceiptPath
+              || JSON.stringify(marker.record.gitResource) !== JSON.stringify(parseGitResource(input.gitResource))
               || JSON.stringify(parseNativeAttemptBinding(marker.record.nativeBinding)) !== JSON.stringify(parseNativeAttemptBinding(input.nativeBinding))) {
               return err(appError('CONFLICT', 'Durable task ID is already reserved for another request', true));
             }
@@ -184,24 +191,24 @@ export class DurableShellTaskIndex {
           const observed = observations?.get(marker.path);
           const unchanged = observed !== undefined && JSON.stringify(observed.record) === JSON.stringify(marker.record);
           const nativeTerminated = unchanged && observed.nativeTerminated;
-          if (marker.record.mutationKind === 'opaque_contained_process') {
-            if (nativeTerminated) {
-              await this.removeMarker(marker.path);
-              continue;
-            }
-            if (input.mutationKind === 'repository_import') {
-              return err({ ...appError('CONFLICT', 'Unverified native process descendants block repository import', true), details: { blocker_kind: marker.record.mutationKind, blocker_state: 'unverified', recovery_requirement: 'trusted_termination_evidence' } });
-            }
-            count(marker.record);
-            continue;
-          }
-          if (marker.record.nativeBinding !== undefined && nativeTerminated) {
+          if (nativeTerminated) {
             await this.removeMarker(marker.path);
             continue;
           }
           const inspection = unchanged ? observed.inspection : 'unknown' as const;
-          if (inspection === 'terminal' && marker.record.legacy !== true) {
+          if (marker.record.mutationKind !== 'opaque_contained_process' && marker.record.nativeBinding === undefined
+            && inspection === 'terminal' && marker.record.legacy !== true) {
             await this.removeMarker(marker.path);
+            continue;
+          }
+          if (gitResourcesConflict(input.gitResource, marker.record.gitResource)) {
+            return err(appError('CONFLICT', 'A live or unresolved Git writer already holds this repository resource', true));
+          }
+          if (marker.record.mutationKind === 'opaque_contained_process') {
+            if (input.mutationKind === 'repository_import') {
+              return err({ ...appError('CONFLICT', 'Unverified native process descendants block repository import', true), details: { blocker_kind: marker.record.mutationKind, blocker_state: 'unverified', recovery_requirement: 'trusted_termination_evidence' } });
+            }
+            count(marker.record);
             continue;
           }
           if (input.mutationKind === 'repository_import' || marker.record.mutationKind === 'repository_import') {
@@ -225,6 +232,7 @@ export class DurableShellTaskIndex {
           capacityClass,
           ...(input.nativeReceiptPath === undefined ? {} : { nativeReceiptPath: input.nativeReceiptPath }),
           ...(input.nativeBinding === undefined ? {} : { nativeBinding: input.nativeBinding }),
+          ...(input.gitResource === undefined ? {} : { gitResource: parseGitResource(input.gitResource) }),
           ownerClientId: input.ownerClientId,
           ...(input.ownerWorkspaceId === undefined ? {} : { ownerWorkspaceId: input.ownerWorkspaceId }),
           reservedAt: this.now().toISOString(),
@@ -390,9 +398,14 @@ export class DurableShellTaskIndex {
         const record = marker.record;
         if (record === undefined || record.taskId === excludedTaskId) return;
         const needsNativeProof = record.mutationKind === 'opaque_contained_process' || record.nativeBinding !== undefined;
-        const nativeTerminated = needsNativeProof ? await this.hasVerifiedNativeTermination(record) : false;
-        const inspection = record.mutationKind === 'opaque_contained_process' ? 'unknown' as const
+        let nativeTerminated = needsNativeProof && await this.hasVerifiedNativeTermination(record);
+        const inspection = record.mutationKind === 'opaque_contained_process' || nativeTerminated ? 'unknown' as const
           : await this.options.inspectTask(record.taskId).catch(() => 'unknown' as const);
+        // A liveness read can reconcile a delayed receipt. A terminal task
+        // projection alone cannot authorize release of a native-bound marker.
+        if (needsNativeProof && inspection === 'terminal') {
+          nativeTerminated = await this.hasVerifiedNativeTermination(record);
+        }
         observations.set(marker.path, { record, nativeTerminated, inspection });
       }));
     }
@@ -400,8 +413,16 @@ export class DurableShellTaskIndex {
   }
 
   private async hasVerifiedNativeTermination(marker: MarkerRecord): Promise<boolean> {
-    if (marker.requestDigest === null || marker.ownerClientId === undefined || marker.nativeReceiptPath === undefined || marker.nativeBinding === undefined
+    if (marker.requestDigest === null || marker.ownerClientId === undefined || marker.nativeBinding === undefined
       || this.options.verifyContainedTermination === undefined) return false;
+    // Older durable-shell markers may omit the receipt location. Their task
+    // directory is fixed by the index root and exact task binding. A managed
+    // writer's separately configured receipt location cannot be inferred.
+    const nativeReceiptPath = marker.nativeReceiptPath ?? (marker.version === 2
+      && reservationCapacityClass(marker) === 'durable_shell' && marker.mutationKind !== 'opaque_contained_process'
+      && marker.nativeBinding.taskId === marker.taskId && isSafeTaskId(marker.taskId)
+      ? path.resolve(this.rootDirectory, marker.taskId, 'containment.receipt.json') : undefined);
+    if (nativeReceiptPath === undefined) return false;
     try {
       return await this.options.verifyContainedTermination({
         taskId: marker.taskId,
@@ -409,8 +430,8 @@ export class DurableShellTaskIndex {
         ownerClientId: marker.ownerClientId,
         ...(marker.ownerWorkspaceId === undefined ? {} : { ownerWorkspaceId: marker.ownerWorkspaceId }),
         mutationKind: marker.mutationKind ?? 'opaque',
-        nativeReceiptPath: marker.nativeReceiptPath,
-        ...(marker.nativeBinding === undefined ? {} : { nativeBinding: marker.nativeBinding }),
+        nativeReceiptPath,
+        nativeBinding: marker.nativeBinding,
         ...(marker.reservedAt === undefined ? {} : { reservedAt: marker.reservedAt }),
       });
     } catch {
@@ -638,6 +659,7 @@ interface MarkerRecord {
   readonly ownerWorkspaceId?: string;
   readonly nativeReceiptPath?: string;
   readonly nativeBinding?: NativeAttemptBinding;
+  readonly gitResource?: GitWriterResource;
   readonly reservedAt?: string;
   readonly launcherPid?: number;
   readonly launcherStartedAt?: string;
@@ -673,6 +695,21 @@ function isReady(value: unknown): value is Record<string, unknown> {
   return isRecord(value) && value.version === 1 && typeof value.readyAt === 'string' && Number.isFinite(Date.parse(value.readyAt));
 }
 
+function parseGitResource(value: unknown): GitWriterResource | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.kind === 'unresolved' && Object.keys(value).length === 1) return { kind: 'unresolved' };
+  if (value.kind === 'common-directory' && Object.keys(value).length === 2
+    && typeof value.digest === 'string' && /^[a-f0-9]{64}$/.test(value.digest)) {
+    return { kind: 'common-directory', digest: value.digest };
+  }
+  return undefined;
+}
+
+function gitResourcesConflict(left: GitWriterResource | undefined, right: GitWriterResource | undefined): boolean {
+  if (left === undefined || right === undefined) return false;
+  return left.kind === 'unresolved' || right.kind === 'unresolved' || left.digest === right.digest;
+}
+
 async function readMarker(filename: string): Promise<MarkerRecord | undefined> {
   const value = await readJson(filename);
   if (!isRecord(value) || value.version !== 1 && value.version !== 2 || typeof value.taskId !== 'string') return undefined;
@@ -683,6 +720,9 @@ async function readMarker(filename: string): Promise<MarkerRecord | undefined> {
   if (value.nativeBinding !== undefined && (nativeBinding === undefined || nativeBinding.reservationId !== value.taskId
     || nativeBinding.requestDigest !== value.requestDigest || nativeBinding.ownerClientId !== value.ownerClientId
     || nativeBinding.workspaceId !== value.ownerWorkspaceId)) return undefined;
+  const gitResource = parseGitResource(value.gitResource);
+  if (value.gitResource !== undefined && (gitResource === undefined || value.version !== 2
+    || value.mutationKind !== 'opaque_uncontained' && value.mutationKind !== 'opaque_contained_process')) return undefined;
   return {
     version: value.version,
     taskId: value.taskId,
@@ -693,6 +733,7 @@ async function readMarker(filename: string): Promise<MarkerRecord | undefined> {
     ...(typeof value.ownerWorkspaceId === 'string' ? { ownerWorkspaceId: value.ownerWorkspaceId } : {}),
     ...(typeof value.nativeReceiptPath === 'string' && path.isAbsolute(value.nativeReceiptPath) ? { nativeReceiptPath: value.nativeReceiptPath } : {}),
     ...(nativeBinding === undefined ? {} : { nativeBinding }),
+    ...(gitResource === undefined ? {} : { gitResource }),
     ...(typeof value.reservedAt === 'string' ? { reservedAt: value.reservedAt } : {}),
     ...(Number.isInteger(value.launcherPid) ? { launcherPid: Number(value.launcherPid) } : {}),
     ...(typeof value.launcherStartedAt === 'string' ? { launcherStartedAt: value.launcherStartedAt } : {}),
