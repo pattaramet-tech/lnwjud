@@ -260,6 +260,16 @@ internal sealed partial class WindowsServiceProcessRuntime
             identity);
     }
 
+    internal void RequireRemovalIdle()
+    {
+        lock (gate)
+        {
+            if (mcpAttempts.Count != 0 || mcpConnections.Count != 0 || attempts.Values.Any(value => !value.IsTerminal
+                || value.MonitorTask is { IsCompleted: false }))
+                throw new IOException("SERVICE_REMOVE_RUNTIME_BUSY");
+        }
+    }
+
     internal async Task StopAsync()
     {
         await StopMcpAsync().ConfigureAwait(false);

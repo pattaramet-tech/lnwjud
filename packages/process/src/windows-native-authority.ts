@@ -50,7 +50,7 @@ export type NativeProcessObservation =
   | { readonly state: 'running'; readonly binding: NativeAttemptBinding; readonly targetPid: number }
   | { readonly state: 'terminal_verified'; readonly binding: NativeAttemptBinding; readonly outcome: 'completed' | 'cancelled' | 'timed_out' | 'interrupted'; readonly exitCode: number; readonly activeProcesses: 0 }
   | { readonly state: 'termination_unknown'; readonly binding: NativeAttemptBinding; readonly reason: string };
-export type NativeControlCommand = 'prepare_import' | 'publish_import' | 'inspect_publication';
+export type NativeControlCommand = 'prepare_import' | 'publish_import' | 'inspect_publication' | 'abort_import';
 export type NativeControlObservation =
   | { readonly state: 'control_verified'; readonly binding: NativeAttemptBinding; readonly command: NativeControlCommand; readonly result: unknown }
   | { readonly state: 'termination_unknown'; readonly binding: NativeAttemptBinding; readonly reason: string };
@@ -419,7 +419,12 @@ export class WindowsNativeAuthority {
       const value = await this.client.request<unknown>({ protocol: 3, command: 'control', identity: input.binding,
         controlCommand: input.command, controlRequest: input.request });
       return toControlObservation(value, input.binding, input.command, isRecord(input.request) ? input.request.commit : undefined);
-    } catch { return unknown(input.binding, 'NATIVE_SERVICE_CONTROL_UNVERIFIED'); }
+    } catch (error) {
+      const reason = serviceFailureCode(error, 'NATIVE_SERVICE_CONTROL_UNVERIFIED');
+      return unknown(input.binding, input.command === 'abort_import' && (reason === 'SERVICE_IMPORT_LEGACY_NEW_BOOT_REQUIRED'
+        || reason === 'SERVICE_IMPORT_LEGACY_BOOT_PROOF_UNAVAILABLE' || reason === 'SERVICE_IMPORT_LEGACY_JOB_UNVERIFIED')
+        ? reason : 'NATIVE_SERVICE_CONTROL_UNVERIFIED');
+    }
   }
   public async inspectControl(input: AttemptLocation & { readonly command: NativeControlCommand }): Promise<NativeControlObservation> {
     try {
@@ -812,7 +817,7 @@ function toControlObservation(value: unknown, binding: NativeAttemptBinding, com
   const identity = parseNativeAttemptBinding(value.identity);
   if (identity === undefined || !sameBinding(identity, binding)) return unknown(binding, 'NATIVE_SERVICE_CONTROL_IDENTITY_MISMATCH');
   const result = value.result;
-  if (!isRecord(result) || result.version !== 2 || result.state !== (command === 'prepare_import' ? 'prepared' : 'published')
+  if (!isRecord(result) || result.version !== 2 || result.state !== (command === 'abort_import' ? 'aborted' : command === 'prepare_import' ? 'prepared' : 'published')
     || typeof result.nativeIdentity !== 'string' || !/^[0-9A-F]{16}-[0-9A-F]{32}$/.test(result.nativeIdentity)
     || typeof result.commit !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(result.commit)
     || expectedCommit !== undefined && result.commit !== expectedCommit) return unknown(binding, 'NATIVE_SERVICE_CONTROL_PROOF_INVALID');

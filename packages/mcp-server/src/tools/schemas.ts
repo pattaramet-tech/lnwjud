@@ -64,6 +64,7 @@ export const gitCloneHandleSchema = z.object({
   workspaceId: workspaceIdSchema,
   taskId: z.string().min(1).max(128),
 }).strict();
+export const gitCloneCancelSchema = gitCloneHandleSchema.extend({ recoverTerminal: z.boolean().optional() }).strict();
 export const gitStatusSchema = workspaceInfoSchema;
 export const gitDiffSchema = z.object({ workspaceId: workspaceIdSchema, path: pathSchema.optional(), staged: z.boolean().optional(), maxBytes: z.number().int().min(1).max(4 * 1024 * 1024).optional() }).strict();
 export const gitLogSchema = z.object({ workspaceId: workspaceIdSchema, maxCommits: z.number().int().min(1).max(100).optional(), maxBytes: z.number().int().min(1).max(4 * 1024 * 1024).optional() }).strict();

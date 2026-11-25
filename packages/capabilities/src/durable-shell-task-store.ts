@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
-import { mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { inspectPosixProcessGroup, PosixProcessTree, parseNativeAttemptBinding, type PosixProcessGroupInspector, type NativeAttemptBinding, type NativeOutputRead, type MacosNativeAuthority, type WindowsNativeAuthority, type WindowsNativeAuthorityConfiguration } from '@lnwjud/process';
@@ -387,6 +387,36 @@ export class DurableShellTaskStore {
 
   public admissionDiagnostics(): Promise<WriterAdmissionDiagnostics> {
     return this.activeIndex.diagnostics();
+  }
+
+  /** Legacy launch identity candidate, never executed. The import runtime must
+   * recompute the digest and the native service must independently authenticate it. */
+  public async legacyRepositoryImportExecutable(binding: NativeAttemptBinding, args: readonly string[], cwd: string): Promise<string | undefined> {
+    if (!/^repository-import-[0-9a-f-]{36}$/.test(binding.taskId) || binding.reservationId !== binding.taskId
+      || binding.attemptId !== binding.taskId || binding.generation !== 1) return undefined;
+    try {
+      const metadata = await this.readMetadata(binding.taskId, false, 1);
+      if (!metadata.ok || !nativeBindingMatchesMetadata(metadata.value, binding)) return undefined;
+      const specPath = path.join(this.taskDirectory(binding.taskId), SPEC_FILENAME);
+      const info = await lstat(specPath);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > 1024 * 1024) return undefined;
+      const spec = JSON.parse(await readFile(specPath, 'utf8')) as DurableWorkerSpec;
+      if (spec.version !== 1 || spec.taskId !== binding.taskId || spec.requestDigest !== binding.requestDigest
+        || spec.cwd !== cwd || spec.timeoutMs !== 900_000 || spec.maxOutputBytes !== 4096
+        || spec.includeStdout !== true || spec.includeStderr !== false || spec.electronRunAsNode !== true
+        || JSON.stringify(spec.arguments) !== JSON.stringify(args)
+        || JSON.stringify(parseNativeAttemptBinding(spec.native?.binding)) !== JSON.stringify(parseNativeAttemptBinding(binding))
+        || typeof spec.executable !== 'string' || !path.isAbsolute(spec.executable)) return undefined;
+      return spec.executable;
+    } catch { return undefined; }
+  }
+
+  /** Readback only: a terminal snapshot may have failed to remove its marker. */
+  public async repositoryImportReservationReleased(binding: NativeAttemptBinding): Promise<boolean> {
+    if (!/^repository-import-[0-9a-f-]{36}$/.test(binding.taskId) || binding.reservationId !== binding.taskId
+      || binding.attemptId !== binding.taskId || binding.generation !== 1 || !/^[a-f0-9]{64}$/.test(binding.requestDigest)) return false;
+    try { return !await this.activeIndex.hasReservation(binding.taskId, binding.requestDigest); }
+    catch { return false; }
   }
 
   public async list(owner?: CapabilityTaskOwner): Promise<Record<string, unknown>[]> {

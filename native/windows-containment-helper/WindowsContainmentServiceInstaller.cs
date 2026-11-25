@@ -15,6 +15,10 @@ internal static class WindowsContainmentServiceInstaller
     private const uint ServiceAllAccess = 0xF01FF;
     private const uint ServiceWin32OwnProcess = 0x00000010;
     private const uint ServiceAutoStart = 0x00000002;
+    private const uint ServiceDemandStart = 0x00000003;
+    private const uint ServiceDisabled = 0x00000004;
+    private const uint ServiceQueryConfigAccess = 0x0001;
+    private const uint ServiceQueryStatusAccess = 0x0004;
     private const uint ServiceErrorNormal = 0x00000001;
     private const uint ServiceControlStop = 1;
     private const uint ServiceStopped = 1;
@@ -161,9 +165,250 @@ internal static class WindowsContainmentServiceInstaller
     [DllImport("kernel32.dll")]
     private static extern nint LocalFree(nint memory);
 
+    // Candidate preflight runs before NSIS invokes an old uninstaller or extracts
+    // application files. It never stops a service, changes SCM, or saves authority state.
+    internal static void PreflightInstallation()
+    {
+        EnsureWindows();
+        using var manager = OpenSCManager(null, null, ScManagerConnect);
+        if (manager.IsInvalid) throw new IOException("SERVICE_INSTALL_SCM_UNAVAILABLE");
+        using var service = OpenService(manager, WindowsContainmentService.ServiceName, ServiceQueryConfigAccess | ServiceQueryStatusAccess);
+        if (service.IsInvalid && Marshal.GetLastWin32Error() != ErrorServiceDoesNotExist)
+            throw new IOException("SERVICE_INSTALL_EXISTING_SERVICE_UNVERIFIED");
+        if (!service.IsInvalid) RequireDisabledStoppedService(service, "SERVICE_INSTALL_EXISTING_SERVICE_NOT_QUIESCED");
+        VerifyProtectedStoreForReplacement(allowLegacyImportHold: false, install: true, requireLedger: !service.IsInvalid);
+        if (!service.IsInvalid) RequireDisabledStoppedService(service, "SERVICE_INSTALL_EXISTING_SERVICE_NOT_QUIESCED");
+    }
+
+    internal static void VerifyProtectedStoreForReplacement(bool allowLegacyImportHold, bool install, bool requireLedger = false, bool forwardReplacement = false)
+    {
+        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "lnwjud-containment");
+        try { InspectStoreForReplacementCore(root, allowLegacyImportHold, verifyAcl: true, requireLedger: requireLedger, forwardReplacement: forwardReplacement); }
+        catch (Exception exception)
+        {
+            var suffix = exception is IOException io && io.Message is "NATIVE_SCHEMA_FORWARD_ONLY" or "NATIVE_RESERVATION_UNVERIFIED" or "NATIVE_IMPORT_UNVERIFIED"
+                ? exception.Message : "NATIVE_STORE_UNVERIFIED";
+            throw new IOException((install ? "SERVICE_INSTALL_" : "SERVICE_REMOVE_") + suffix);
+        }
+    }
+
+    // The test assembly calls the exact read-only policy with isolated store
+    // files. Only the production entry above selects the protected machine root.
+ #if NATIVE_CONTAINMENT_TESTS
+    internal static void InspectStoreForReplacement(string root, bool allowLegacyImportHold, bool verifyAcl, bool requireLedger = false, bool forwardReplacement = false)
+        => InspectStoreForReplacementCore(root, allowLegacyImportHold, verifyAcl, requireLedger, forwardReplacement);
+ #endif
+    private static void InspectStoreForReplacementCore(string root, bool allowLegacyImportHold, bool verifyAcl, bool requireLedger, bool forwardReplacement)
+    {
+        ServiceAttemptLedgerPersistence.EnsureNoReparsePoints(root);
+        static bool Exists(string name, bool directory)
+        {
+            FileAttributes attrs;
+            try { attrs = File.GetAttributes(name); }
+            catch (FileNotFoundException) { return false; }
+            catch (DirectoryNotFoundException) { return false; }
+            if ((attrs & FileAttributes.ReparsePoint) != 0 || ((attrs & FileAttributes.Directory) != 0) != directory)
+                throw new IOException("NATIVE_STORE_UNVERIFIED");
+            return true;
+        }
+        if (!Exists(root, true))
+        {
+            if (requireLedger) throw new IOException("NATIVE_STORE_UNVERIFIED");
+            return;
+        }
+        if (verifyAcl) WindowsContainmentService.EnsureStoreAcl(new DirectoryInfo(root).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access));
+        var ledgerPath = Path.Combine(root, "attempts.json");
+        var importsPath = Path.Combine(root, "imports");
+        if (!Exists(ledgerPath, false))
+        {
+            // Existing nonempty authority without its ledger is not fresh.
+            if (requireLedger || Directory.EnumerateFileSystemEntries(root).Any()) throw new IOException("NATIVE_STORE_UNVERIFIED");
+            return;
+        }
+        if (verifyAcl) WindowsContainmentService.EnsureStoreAcl(new FileInfo(ledgerPath).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access));
+        var persistence = new ServiceAttemptLedgerPersistence(ledgerPath);
+        var records = persistence.Load();
+        if (persistence.LoadedSchemaVersion >= 3 && !forwardReplacement) throw new IOException("NATIVE_SCHEMA_FORWARD_ONLY");
+        var attempts = new Dictionary<string, PersistedServiceAttempt>(StringComparer.Ordinal);
+        var expectedImports = new Dictionary<string, PersistedServiceAttempt>(StringComparer.OrdinalIgnoreCase);
+        foreach (var record in records)
+        {
+            ServiceAttemptLedger.ValidateStored(record);
+            if (!attempts.TryAdd(record.Request.Identity.AttemptId, record)) throw new IOException("NATIVE_STORE_UNVERIFIED");
+            if (record.Phase is not (ServiceAttemptPhase.TerminalVerified or ServiceAttemptPhase.LaunchNotStarted))
+                throw new IOException("NATIVE_RESERVATION_UNVERIFIED");
+            if (record.Request.ImportValidationPending == true)
+                throw new IOException("NATIVE_RESERVATION_UNVERIFIED");
+            if (record.ReservationHeld || record.Request.HoldForImport)
+            {
+                // Only a candidate upgrade can carry the exact terminal legacy
+                // hold forward. Neither replacement nor uninstall releases it.
+                if (!allowLegacyImportHold || !record.ReservationHeld || !record.Request.HoldForImport
+                    || record.Phase != ServiceAttemptPhase.TerminalVerified || record.Request.Shared || record.Request.RegistryOnly
+                    || record.Request.PublicationCommitted != false || (!forwardReplacement && record.Request.ImportValidationPending is not null)
+                    || !String.Equals(record.Request.ReservationKey, ServiceAttemptLedger.GlobalReservationKey, StringComparison.OrdinalIgnoreCase)
+                    || ContainedProcess.QueryJob(ContainedProcess.GetJobName(record.Request.Identity.AttemptId)).Status != ContainedProcess.JobProbeStatus.NotFound)
+                    throw new IOException("NATIVE_RESERVATION_UNVERIFIED");
+            }
+            expectedImports.Add(ServiceImportTransactionRuntime.RecordFilename(importsPath, record.Request.Identity), record);
+        }
+        if (records.Count(record => record.ReservationHeld) > 1) throw new IOException("NATIVE_RESERVATION_UNVERIFIED");
+        var observed = new HashSet<string>(StringComparer.Ordinal);
+        if (Exists(importsPath, true))
+        {
+            if (verifyAcl) WindowsContainmentService.EnsureStoreAcl(new DirectoryInfo(importsPath).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access));
+            foreach (var filename in Directory.EnumerateFileSystemEntries(importsPath))
+            {
+                if (!expectedImports.TryGetValue(filename, out var record) || !Exists(filename, false))
+                    throw new IOException("NATIVE_IMPORT_UNVERIFIED");
+                if (verifyAcl) WindowsContainmentService.EnsureStoreAcl(new FileInfo(filename).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access));
+                var transaction = ServiceImportTransactionRuntime.ReadRecord(filename, record.Request.Identity, record.Request.AuthenticatedCallerSid);
+                if (transaction is null) throw new IOException("NATIVE_IMPORT_UNVERIFIED");
+                if (transaction.Phase == ServiceImportPhase.Aborted && forwardReplacement)
+                {
+                    if (record.Phase != ServiceAttemptPhase.TerminalVerified || record.Request.PublicationCommitted != false
+                        || record.Request.Shared || record.Request.RegistryOnly || record.Request.HoldForImport != record.ReservationHeld
+                        || !String.Equals(record.Request.ReservationKey, ServiceAttemptLedger.GlobalReservationKey, StringComparison.OrdinalIgnoreCase)
+                        || (record.Request.ImportValidationPending != false && !ServiceAttemptLedger.HasLegacyBootProof(record.Request)))
+                        throw new IOException("NATIVE_IMPORT_UNVERIFIED");
+                }
+                else if (transaction.Version != 1
+                    || (record.ReservationHeld ? transaction.Phase != ServiceImportPhase.Prepared : transaction.Phase != ServiceImportPhase.Published)
+                    || (transaction.Phase == ServiceImportPhase.Published && record.Request.PublicationCommitted != true))
+                    throw new IOException("NATIVE_IMPORT_UNVERIFIED");
+                observed.Add(record.Request.Identity.AttemptId);
+            }
+        }
+        // V2 ordinary shared attempts serialized PublicationCommitted=false by
+        // default. That alone is not import evidence and must not require a
+        // transaction record. Explicit validation/boot evidence or an exclusive
+        // global publication fence still requires its exact durable record.
+        if (records.Any(record => (record.ReservationHeld || record.Request.PublicationCommitted == true
+                || record.Request.ImportValidationPending is not null || record.Request.LegacyImportObservedBoot is not null
+                || (!record.Request.Shared && !record.Request.RegistryOnly && record.Request.PublicationCommitted == false
+                    && String.Equals(record.Request.ReservationKey, ServiceAttemptLedger.GlobalReservationKey, StringComparison.OrdinalIgnoreCase)))
+                && !observed.Contains(record.Request.Identity.AttemptId)))
+            throw new IOException("NATIVE_IMPORT_UNVERIFIED");
+    }
+
+    // Explicit maintenance lane; not invoked by ordinary NSIS or the managed
+    // updater. The candidate must already be staged in a protected full package
+    // tree. Never overwrite old files or delete/recreate the SCM service.
+    internal static void Replace(string expectedCurrentHash, string expectedCandidateHash, bool preflightOnly)
+    {
+        EnsureWindows();
+        ValidateSha256(expectedCurrentHash);
+        ValidateSha256(expectedCandidateHash);
+        using var identity = WindowsIdentity.GetCurrent();
+        if (!new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
+            throw new IOException("SERVICE_INSTALL_REPLACEMENT_ADMIN_REQUIRED");
+        var programFiles = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
+        var programData = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData));
+        var image = Path.GetFullPath(Environment.ProcessPath ?? throw new IOException("SERVICE_INSTALL_IMAGE_UNAVAILABLE"));
+        var candidateRoot = ValidateImagePath(image, programFiles);
+        if (UpdateStartupGate.InspectFootprint().Kind != "unmanaged" || UpdateStartupGate.HasPrivateAuthority(programData))
+            throw new IOException("SERVICE_INSTALL_REPLACEMENT_MANAGED_AUTHORITY_REFUSED");
+        using var manager = OpenSCManager(null, null, ScManagerConnect);
+        if (manager.IsInvalid) throw new IOException("SERVICE_INSTALL_SCM_UNAVAILABLE");
+        using var service = OpenService(manager, WindowsContainmentService.ServiceName, ServiceAllAccess);
+        if (service.IsInvalid) throw new IOException("SERVICE_INSTALL_EXISTING_SERVICE_UNVERIFIED");
+        RequireDisabledStoppedService(service, "SERVICE_INSTALL_EXISTING_SERVICE_NOT_QUIESCED");
+        var oldImage = QueryImagePath(service);
+        var oldRoot = ValidateImagePath(oldImage, programFiles);
+        RequireSeparateReplacementRoots(candidateRoot, oldRoot);
+        if (ServiceEndpointIdentity.InspectSlotImage(image, programFiles) is not null
+            || ServiceEndpointIdentity.InspectSlotImage(oldImage, programFiles) is not null)
+            throw new IOException("SERVICE_INSTALL_REPLACEMENT_LAYOUT_REFUSED");
+        // Retain non-delete-sharing handles through the switch and readback.
+        var pins = new List<SafeFileHandle>();
+        try
+        {
+            void PinTree(string path, string root)
+            {
+                pins.Add(ServiceEndpointIdentity.OpenProtected(path, directory: false));
+                for (var parent = Path.GetDirectoryName(path); parent is not null; parent = Path.GetDirectoryName(parent))
+                {
+                    pins.Add(ServiceEndpointIdentity.OpenProtected(parent, directory: true));
+                    if (String.Equals(parent, programFiles, StringComparison.OrdinalIgnoreCase)) break;
+                }
+                VerifyProtectedAncestors(root, programFiles);
+            }
+            PinTree(oldImage, oldRoot);
+            PinTree(image, candidateRoot);
+            pins.Add(ServiceEndpointIdentity.OpenProtected(Path.Combine(Path.GetDirectoryName(image)!, "manifest.json"), directory: false));
+            pins.Add(ServiceEndpointIdentity.OpenProtected(Path.Combine(Path.GetDirectoryName(image)!, "lnwjud-containment-pin.node"), directory: false));
+            ServiceEndpointIdentity.ValidateImage(oldImage, programFiles, expectedCurrentHash);
+            ServiceEndpointIdentity.ValidateImage(image, programFiles, expectedCandidateHash);
+            VerifyPackageManifest(image);
+            VerifyProtectedStoreForReplacement(allowLegacyImportHold: true, install: true, requireLedger: true, forwardReplacement: true);
+            RequireDisabledStoppedService(service, "SERVICE_INSTALL_EXISTING_SERVICE_NOT_QUIESCED");
+            if (!String.Equals(QueryImagePath(service), oldImage, StringComparison.OrdinalIgnoreCase)
+                || UpdateStartupGate.InspectFootprint().Kind != "unmanaged" || UpdateStartupGate.HasPrivateAuthority(programData))
+                throw new IOException("SERVICE_INSTALL_REPLACEMENT_AUTHORITY_CHANGED");
+            if (preflightOnly) return;
+            // First switch while disabled. Any interruption before activation
+            // leaves the candidate registered but unable to start automatically.
+            ConfigureReplacement(service, image, ServiceDisabled);
+            RequireDisabledStoppedService(service, "SERVICE_INSTALL_REPLACEMENT_CONFIG_UNVERIFIED");
+            if (!String.Equals(QueryImagePath(service), image, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("SERVICE_INSTALL_REPLACEMENT_CONFIG_UNVERIFIED");
+            ApplyServiceSecurity(service);
+            VerifyProtectedStoreForReplacement(allowLegacyImportHold: true, install: true, requireLedger: true, forwardReplacement: true);
+            RequireDisabledStoppedService(service, "SERVICE_INSTALL_REPLACEMENT_CONFIG_UNVERIFIED");
+            ConfigureReplacement(service, image, ServiceDemandStart);
+            RequireReplacementState(service, image, ServiceDemandStart, running: false);
+            StartAndWait(service);
+            var activatedPid = RequireReplacementState(service, image, ServiceDemandStart, running: true);
+            // SCM running is not readiness. Authenticate the actual peer image
+            // and require its native startup result before enabling auto-start.
+            using var reply = JsonDocument.Parse(WindowsContainmentServiceClient.SendAsync(expectedCandidateHash,
+                JsonSerializer.SerializeToUtf8Bytes(new { protocol = 3, command = "update_startup" })).GetAwaiter().GetResult());
+            var result = reply.RootElement;
+            if (result.GetProperty("protocol").GetInt32() != 3 || !result.GetProperty("ok").GetBoolean()
+                || result.GetProperty("result").GetProperty("kind").GetString() != "unmanaged"
+                || RequireReplacementState(service, image, ServiceDemandStart, running: true) != activatedPid)
+                throw new IOException("SERVICE_INSTALL_REPLACEMENT_READINESS_UNVERIFIED");
+            ConfigureReplacement(service, image, ServiceAutoStart);
+            if (RequireReplacementState(service, image, ServiceAutoStart, running: true) != activatedPid)
+                throw new IOException("SERVICE_INSTALL_REPLACEMENT_CONFIG_UNVERIFIED");
+        }
+        finally
+        {
+            foreach (var pin in pins) pin.Dispose();
+            // Never roll back to the old image, stop a possibly admitted writer,
+            // restore an older ledger, or delete a registration after failure.
+        }
+    }
+
+    private static uint RequireReplacementState(SafeServiceHandle service, string image, uint startType, bool running)
+    {
+        var config = ReadServiceConfiguration(service);
+        var status = QueryStatus(service);
+        return ValidateReplacementState(image, startType, running, config.ImagePath, config.StartType, config.ServiceType,
+            config.Account, status.CurrentState, status.ProcessId);
+    }
+
+    internal static uint ValidateReplacementState(string image, uint startType, bool running, string observedImage,
+        uint observedStartType, uint serviceType, string account, uint state, uint pid)
+    {
+        if (!String.Equals(image, observedImage, StringComparison.OrdinalIgnoreCase) || observedStartType != startType
+            || serviceType != ServiceWin32OwnProcess || !String.Equals(account, "LocalSystem", StringComparison.OrdinalIgnoreCase)
+            || (running ? state != ServiceRunning || pid == 0 : state != ServiceStopped || pid != 0))
+            throw new IOException("SERVICE_INSTALL_REPLACEMENT_CONFIG_UNVERIFIED");
+        return pid;
+    }
+
+    private static void ConfigureReplacement(SafeServiceHandle service, string image, uint startType)
+    {
+        if (!ChangeServiceConfig(service, ServiceWin32OwnProcess, startType, ServiceErrorNormal,
+                BuildServiceCommand(image), null, 0, null, "LocalSystem", null, "lnwjud Windows Containment"))
+            throw new IOException("SERVICE_INSTALL_REPLACEMENT_CONFIGURE_FAILED");
+    }
+
     internal static void Install()
     {
         EnsureWindows();
+        PreflightInstallation();
         var imagePath = Path.GetFullPath(Environment.ProcessPath ?? throw new IOException("SERVICE_INSTALL_IMAGE_UNAVAILABLE"));
         var programFiles = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
         var installRoot = ValidateImagePath(imagePath, programFiles);
@@ -188,7 +433,7 @@ internal static class WindowsContainmentServiceInstaller
                 "lnwjud Windows Containment",
                 ServiceAllAccess,
                 ServiceWin32OwnProcess,
-                ServiceAutoStart,
+                ServiceDisabled,
                 ServiceErrorNormal,
                 BuildServiceCommand(imagePath),
                 null,
@@ -202,12 +447,21 @@ internal static class WindowsContainmentServiceInstaller
 
         using (service)
         {
+            var activationAttempted = false;
             try
             {
                 var installedImage = QueryImagePath(service);
                 if (!String.Equals(installedImage, imagePath, StringComparison.OrdinalIgnoreCase))
                     throw new IOException("SERVICE_INSTALL_EXISTING_IMAGE_MISMATCH");
-                StopAndWait(service);
+                // The newly created service is already stopped. For existing
+                // service registrations repeat the no-stop preflight before replacement.
+                if (!created)
+                {
+                    RequireDisabledStoppedService(service, "SERVICE_INSTALL_EXISTING_SERVICE_NOT_QUIESCED");
+                    VerifyProtectedStoreForReplacement(allowLegacyImportHold: false, install: true, requireLedger: true);
+                    RequireDisabledStoppedService(service, "SERVICE_INSTALL_EXISTING_SERVICE_NOT_QUIESCED");
+                }
+                if (created) InitializeFreshStoreIfAbsent();
                 if (!ChangeServiceConfig(
                         service,
                         ServiceWin32OwnProcess,
@@ -222,23 +476,75 @@ internal static class WindowsContainmentServiceInstaller
                         "lnwjud Windows Containment"))
                     throw new IOException("SERVICE_INSTALL_CONFIGURE_FAILED");
                 ApplyServiceSecurity(service);
+                activationAttempted = true;
                 StartAndWait(service);
             }
             catch
             {
-                if (created)
+                // Once activation was attempted, preserve SCM and authority for
+                // inspection; never stop/delete a potentially admitted writer.
+                if (created && !activationAttempted)
                 {
-                    try { StopAndWait(service); } catch { }
-                    _ = DeleteService(service);
+                    try
+                    {
+                        var status = QueryStatus(service);
+                        if (status.CurrentState == ServiceStopped && status.ProcessId == 0) _ = DeleteService(service);
+                    }
+                    catch { /* preserve the original failure and uncertain registration */ }
                 }
                 throw;
             }
         }
     }
 
+    private static void InitializeFreshStoreIfAbsent()
+    {
+        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "lnwjud-containment");
+        ServiceAttemptLedgerPersistence.EnsureNoReparsePoints(root);
+        // Reinstall retains an existing ledger; never manufacture a missing
+        // ledger in an existing directory or overwrite any authority bytes.
+        if (Directory.Exists(root))
+        {
+            VerifyProtectedStoreForReplacement(allowLegacyImportHold: false, install: true, requireLedger: true);
+            return;
+        }
+        var security = new DirectorySecurity();
+        security.SetAccessRuleProtection(true, false);
+        security.SetOwner(AdministratorsSid);
+        var inheritance = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+        foreach (var sid in new[] { SystemSid, AdministratorsSid })
+            security.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl, inheritance, PropagationFlags.None, AccessControlType.Allow));
+        var directory = security.CreateDirectory(root);
+        WindowsContainmentService.EnsureStoreAcl(directory.GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access));
+        ServiceAttemptLedgerPersistence.EnsureNoReparsePoints(root);
+        if (Directory.EnumerateFileSystemEntries(root).Any()) throw new IOException("SERVICE_INSTALL_NATIVE_STORE_UNVERIFIED");
+        var filename = Path.Combine(root, "attempts.json");
+        WriteFreshLedger(filename);
+        var fileSecurity = new FileSecurity();
+        fileSecurity.SetAccessRuleProtection(true, false);
+        fileSecurity.SetOwner(AdministratorsSid);
+        foreach (var sid in new[] { SystemSid, AdministratorsSid })
+            fileSecurity.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl, AccessControlType.Allow));
+        new FileInfo(filename).SetAccessControl(fileSecurity);
+        VerifyProtectedStoreForReplacement(allowLegacyImportHold: false, install: true, requireLedger: true);
+    }
+
+    internal static void WriteFreshLedger(string filename)
+    {
+        using var stream = new FileStream(filename, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough);
+        stream.Write("{\"schemaVersion\":2,\"attempts\":[]}"u8);
+        stream.Flush(true);
+    }
+
     internal static void Uninstall()
     {
         EnsureWindows();
+        // A previous installer invokes the currently installed uninstaller. Never
+        // permit ordinary removal of V3 authority, even when all attempts settled.
+        var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+        if (UpdateStartupGate.InspectFootprint().Kind != "unmanaged" || UpdateStartupGate.HasPrivateAuthority(programData))
+            throw new IOException("SERVICE_REMOVE_MANAGED_AUTHORITY_REFUSED");
+        VerifyProtectedStoreForReplacement(allowLegacyImportHold: false, install: false);
         using var manager = OpenSCManager(null, null, ScManagerConnect);
         if (manager.IsInvalid) throw new IOException("SERVICE_REMOVE_SCM_UNAVAILABLE");
         var service = OpenService(manager, WindowsContainmentService.ServiceName, ServiceAllAccess);
@@ -252,7 +558,42 @@ internal static class WindowsContainmentServiceInstaller
 
         using (service)
         {
-            StopAndWait(service);
+            var image = Path.GetFullPath(Environment.ProcessPath ?? throw new IOException("SERVICE_REMOVE_IMAGE_UNAVAILABLE"));
+            if (!String.Equals(QueryImagePath(service), image, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("SERVICE_REMOVE_EXISTING_IMAGE_MISMATCH");
+            var config = ReadServiceConfiguration(service);
+            var status = QueryStatus(service);
+            if (config.ServiceType != ServiceWin32OwnProcess || !String.Equals(config.Account, "LocalSystem", StringComparison.OrdinalIgnoreCase))
+                throw new IOException("SERVICE_REMOVE_EXISTING_SERVICE_NOT_QUIESCED");
+            if (UpdateStartupGate.InspectFootprint().Kind != "unmanaged" || UpdateStartupGate.HasPrivateAuthority(programData))
+                throw new IOException("SERVICE_REMOVE_MANAGED_AUTHORITY_REFUSED");
+            if (status.CurrentState == ServiceRunning && status.ProcessId != 0)
+            {
+                using var process = Process.GetProcessById(checked((int)status.ProcessId));
+                _ = process.Handle; // Hold exact process identity across SCM readback.
+                if (process.HasExited) throw new IOException("SERVICE_REMOVE_AUTHORITY_CHANGED");
+                var hash = HashFile(image);
+                using var reply = JsonDocument.Parse(WindowsContainmentServiceClient.SendAsync(hash,
+                    JsonSerializer.SerializeToUtf8Bytes(new { protocol = 3, command = "maintenance_remove" })).GetAwaiter().GetResult());
+                var response = reply.RootElement;
+                if (response.GetProperty("protocol").GetInt32() != 3 || !response.GetProperty("ok").GetBoolean()
+                    || response.GetProperty("result").GetProperty("kind").GetString() != "removal_fenced"
+                    || response.GetProperty("result").GetProperty("pid").GetUInt32() != status.ProcessId)
+                    throw new IOException("SERVICE_REMOVE_ADMISSION_NOT_FENCED");
+                VerifyProtectedStoreForReplacement(allowLegacyImportHold: false, install: false, requireLedger: true);
+                if (process.HasExited || RequireReplacementState(service, image, config.StartType, running: true) != status.ProcessId)
+                    throw new IOException("SERVICE_REMOVE_AUTHORITY_CHANGED");
+                ConfigureReplacement(service, image, ServiceDisabled);
+                if (process.HasExited || RequireReplacementState(service, image, ServiceDisabled, running: true) != status.ProcessId)
+                    throw new IOException("SERVICE_REMOVE_AUTHORITY_CHANGED");
+                StopAndWait(service);
+            }
+            RequireDisabledStoppedService(service, "SERVICE_REMOVE_EXISTING_SERVICE_NOT_QUIESCED");
+            VerifyProtectedStoreForReplacement(allowLegacyImportHold: false, install: false, requireLedger: true);
+            RequireDisabledStoppedService(service, "SERVICE_REMOVE_EXISTING_SERVICE_NOT_QUIESCED");
+            if (!String.Equals(QueryImagePath(service), image, StringComparison.OrdinalIgnoreCase)
+                || UpdateStartupGate.InspectFootprint().Kind != "unmanaged" || UpdateStartupGate.HasPrivateAuthority(programData))
+                throw new IOException("SERVICE_REMOVE_AUTHORITY_CHANGED");
             if (!DeleteService(service))
             {
                 var error = Marshal.GetLastWin32Error();
@@ -464,6 +805,15 @@ internal static class WindowsContainmentServiceInstaller
     private static bool IsTrusted(SecurityIdentifier? sid) =>
         sid is not null && (sid.Equals(SystemSid) || sid.Equals(AdministratorsSid) || sid.Equals(TrustedInstallerSid));
 
+    internal static void RequireSeparateReplacementRoots(string candidateRoot, string oldRoot)
+    {
+        candidateRoot = Path.GetFullPath(candidateRoot);
+        oldRoot = Path.GetFullPath(oldRoot);
+        if (String.Equals(candidateRoot, oldRoot, StringComparison.OrdinalIgnoreCase)
+            || IsBelowRoot(candidateRoot, oldRoot) || IsBelowRoot(oldRoot, candidateRoot))
+            throw new IOException("SERVICE_INSTALL_REPLACEMENT_LAYOUT_REFUSED");
+    }
+
     private static bool IsBelowRoot(string path, string root)
     {
         var relative = Path.GetRelativePath(Path.GetFullPath(root), Path.GetFullPath(path));
@@ -502,7 +852,9 @@ internal static class WindowsContainmentServiceInstaller
         finally { _ = LocalFree(descriptor); }
     }
 
-    private static string QueryImagePath(SafeServiceHandle service)
+    private static string QueryImagePath(SafeServiceHandle service) => ReadServiceConfiguration(service).ImagePath;
+
+    private static (string ImagePath, uint StartType, uint ServiceType, string Account) ReadServiceConfiguration(SafeServiceHandle service)
     {
         if (QueryServiceConfig(service, 0, 0, out var required)
             || Marshal.GetLastWin32Error() != ErrorInsufficientBuffer
@@ -515,9 +867,20 @@ internal static class WindowsContainmentServiceInstaller
                 throw new IOException("SERVICE_INSTALL_CONFIG_UNAVAILABLE");
             var configuration = Marshal.PtrToStructure<QueryServiceConfiguration>(buffer);
             var command = Marshal.PtrToStringUni(configuration.BinaryPathName) ?? throw new IOException("SERVICE_INSTALL_CONFIG_INVALID");
-            return ParseRegisteredImagePath(command);
+            return (ParseRegisteredImagePath(command), configuration.StartType, configuration.ServiceType,
+                Marshal.PtrToStringUni(configuration.ServiceStartName) ?? throw new IOException("SERVICE_INSTALL_CONFIG_INVALID"));
         }
         finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    private static void RequireDisabledStoppedService(SafeServiceHandle service, string reason)
+    {
+        var configuration = ReadServiceConfiguration(service);
+        var status = QueryStatus(service);
+        if (configuration.StartType != ServiceDisabled || configuration.ServiceType != ServiceWin32OwnProcess
+            || !String.Equals(configuration.Account, "LocalSystem", StringComparison.OrdinalIgnoreCase)
+            || status.CurrentState != ServiceStopped || status.ProcessId != 0)
+            throw new IOException(reason);
     }
 
     internal static string ParseRegisteredImagePath(string command)

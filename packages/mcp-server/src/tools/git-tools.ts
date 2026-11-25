@@ -1,5 +1,5 @@
 import { defineTool, missingService, type McpToolContext, type McpToolDefinition } from './tool-types.js';
-import { gitCloneSafeSchema, gitCloneHandleSchema, gitDiffSchema, gitLogSchema, gitRunSchema, gitStatusSchema } from './schemas.js';
+import { gitCloneSafeSchema, gitCloneHandleSchema, gitCloneCancelSchema, gitDiffSchema, gitLogSchema, gitRunSchema, gitStatusSchema } from './schemas.js';
 
 export function gitTools(context: McpToolContext): McpToolDefinition[] {
   return [
@@ -68,13 +68,16 @@ export function gitTools(context: McpToolContext): McpToolDefinition[] {
     }),
     defineTool({
       name: 'git_clone_cancel',
-      description: 'Cancel only an owned durable repository import, keeping native unknown/child liveness fail-closed.',
+      description: 'Cancel an owned durable repository import. recoverTerminal: true requests separately host-approved terminal-only recovery of the exact attempt; no live cancellation, launch, directory modification or writer lease grant.',
       permission: 'EXECUTE',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      inputSchema: gitCloneHandleSchema,
-      handler: async (input) => context.services.repositoryImport === undefined
+      inputSchema: gitCloneCancelSchema,
+      handler: async (input, _signal, authorization) => context.services.repositoryImport === undefined
         ? missingService()
-        : context.services.repositoryImport.cancel(context.actor, input.workspaceId, input.taskId),
+        : input.recoverTerminal === true
+          ? context.services.repositoryImport.recoverTerminal === undefined ? missingService()
+            : context.services.repositoryImport.recoverTerminal(context.actor, input.workspaceId, input.taskId, authorization)
+          : context.services.repositoryImport.cancel(context.actor, input.workspaceId, input.taskId),
     }),
     defineTool({
       name: 'git',

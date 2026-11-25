@@ -41,12 +41,14 @@ interface ImportManifest {
   readonly binding: NativeAttemptBinding;
   readonly authorityConfig: WindowsNativeAuthorityConfig;
   readonly processModule: string;
+  // Bound by manifestDigest; never executed by recovery.
+  readonly launchExecutable?: string;
   readonly originalInput: SecureRepositoryImportStart;
 }
 
 interface NativeReceipt {
   readonly version: 2;
-  readonly state: 'prepared' | 'published';
+  readonly state: 'prepared' | 'published' | 'aborted';
   readonly nativeIdentity: string;
   readonly commit: string;
 }
@@ -116,6 +118,7 @@ export class SecureRepositoryImportRuntime {
           privateHome: path.join(directory, 'home'),
           authorityConfig: this.nativeAuthority.config,
           processModule: fileURLToPath(import.meta.resolve('@lnwjud/process')),
+          launchExecutable: launchRequestBase.executable,
           originalInput: input,
         };
         const manifestDigest = createHash('sha256').update(JSON.stringify(core)).digest('hex');
@@ -146,11 +149,34 @@ export class SecureRepositoryImportRuntime {
     const manifest = await this.readOwnedManifest(input);
     if (!manifest.ok) return manifest;
     if (manifest.value.version !== 2) return ok({ task_id: input.taskId, state: 'unresolved', detail: 'Legacy native publication proof requires reconciliation' });
-    const snapshot = await this.taskStore.snapshot(input.taskId, undefined, input.owner);
+    let snapshot = await this.taskStore.snapshot(input.taskId, undefined, input.owner);
     if (!snapshot.ok) return snapshot;
-    const state = snapshot.value.state;
+    let state = snapshot.value.state;
+    // Native publication readback can finalize an already-renamed transaction
+    // without replaying publication. The worker can look running/unverified
+    // while that transaction retains the service reservation.
+    if (state === 'running' || state === 'termination_unverified') {
+      const published = await this.nativeReceipt(manifest.value, 'publish_import');
+      if (published?.commit === manifest.value.commit) {
+        snapshot = await this.taskStore.snapshot(input.taskId, undefined, input.owner);
+        if (!snapshot.ok) return snapshot;
+        state = snapshot.value.state;
+      }
+    }
     const response = { task_id: input.taskId, requested_commit: manifest.value.commit, destination: manifest.value.destination };
     if (state === 'starting') return ok({ ...response, state: 'starting' });
+    const aborted = await this.nativeReceipt(manifest.value, 'abort_import');
+    if (aborted?.state === 'aborted' && aborted.commit === manifest.value.commit) {
+      // A verified native abort is not a successful import. Keep runtime
+      // reconciliation visible until its own terminal reservation is released.
+      if (state !== 'completed' && state !== 'failed' && state !== 'cancelled' && state !== 'timed_out') {
+        return ok({ ...response, state: 'unresolved', import_outcome: 'aborted', detail: 'Native abort verified; runtime terminal reconciliation is incomplete' });
+      }
+      if (!await this.taskStore.repositoryImportReservationReleased(manifest.value.binding)) {
+        return ok({ ...response, state: 'unresolved', import_outcome: 'aborted', detail: 'Native abort verified; runtime reservation release is not verified' });
+      }
+      return ok({ ...response, state: 'cancelled', import_outcome: 'aborted', native_identity: aborted.nativeIdentity });
+    }
     if (state === 'running') return ok({ ...response, state: 'running' });
     if (state === 'completed' && snapshot.value.exit_code === 0) {
       const native = await this.nativeReceipt(manifest.value, 'publish_import');
@@ -198,9 +224,33 @@ export class SecureRepositoryImportRuntime {
   async cancel(input: SecureRepositoryImportHandle): Promise<Result<Record<string, unknown>>> {
     const manifest = await this.readOwnedManifest(input);
     if (!manifest.ok) return manifest;
+    // An explicit owner cancellation may recover an already-terminal import
+    // whose native hold prevented the generic task store from seeing terminal.
+    // Status never initiates this mutating control.
+    if (await this.abortPreparedImport(manifest.value)) return this.status(input);
     const cancelled = await this.taskStore.cancel(input.taskId, input.owner);
     if (!cancelled.ok) return cancelled;
+    await this.abortPreparedImport(manifest.value);
     return this.status(input);
+  }
+
+  /** Invoked only through the separately host-approved application recovery use-case.
+   * The native request always carries the original authenticated binding, never
+   * the requesting session substituted into it. No live cancellation or launch.
+   */
+  async recoverTerminal(input: SecureRepositoryImportHandle & { readonly workspaceRoot: string }): Promise<Result<Record<string, unknown>>> {
+    const manifest = await this.readOwnedManifest(input, input.workspaceRoot);
+    if (!manifest.ok) return manifest;
+    let refusal: string | undefined;
+    if (manifest.value.version !== 2 || !await this.abortPreparedImport(manifest.value, (reason) => { refusal = reason; }, true)) {
+      const message = refusal === 'SERVICE_IMPORT_LEGACY_NEW_BOOT_REQUIRED'
+        ? 'Legacy terminal import boot witness recorded; a distinct verified kernel boot and renewed host approval are required; reservation retained'
+        : refusal === 'SERVICE_IMPORT_LEGACY_BOOT_PROOF_UNAVAILABLE' || refusal === 'SERVICE_IMPORT_LEGACY_JOB_UNVERIFIED'
+          ? 'Legacy native boot or Job proof is unavailable; reservation retained'
+          : 'Native terminal import abort proof is unavailable; reservation retained';
+      return err(appError('CONFLICT', message, true));
+    }
+    return this.status({ taskId: input.taskId, owner: manifest.value.owner });
   }
 
   private taskId(requestId: string): string {
@@ -211,7 +261,7 @@ export class SecureRepositoryImportRuntime {
     return path.join(this.root, requestId.toLowerCase());
   }
 
-  private async readOwnedManifest(handle: SecureRepositoryImportHandle): Promise<Result<ImportManifest>> {
+  private async readOwnedManifest(handle: SecureRepositoryImportHandle, hostApprovedRecoveryRoot?: string): Promise<Result<ImportManifest>> {
     if (!/^repository-import-[0-9a-f-]{36}$/.test(handle.taskId)) {
       return err(appError('INVALID_INPUT', 'Repository import task ID is invalid'));
     }
@@ -220,28 +270,42 @@ export class SecureRepositoryImportRuntime {
       const value = JSON.parse(await readFile(path.join(this.importDirectory(requestId), 'spec.json'), 'utf8')) as ImportManifest;
       if ((value.version !== 2 && Number(value.version) !== 1) || value.requestId !== requestId
         || value.owner.clientId !== handle.owner.clientId
-        || value.owner.sessionId !== handle.owner.sessionId
-        || value.owner.workspaceId !== handle.owner.workspaceId) {
+        || value.owner.workspaceId !== handle.owner.workspaceId
+        || (hostApprovedRecoveryRoot === undefined ? value.owner.sessionId !== handle.owner.sessionId
+          : value.version !== 2 || typeof value.owner.sessionId !== 'string' || !value.owner.sessionId
+            || path.win32.normalize(value.workspaceRoot).toLowerCase() !== path.win32.normalize(hostApprovedRecoveryRoot).toLowerCase())) {
         return err(appError('PERMISSION_DENIED', 'Repository import belongs to another client, session or workspace'));
       }
       if (value.version === 2 && (!value.binding
         || value.binding.taskId !== handle.taskId || value.binding.reservationId !== handle.taskId
         || value.binding.attemptId !== handle.taskId || value.binding.generation !== 1
-        || value.binding.ownerClientId !== handle.owner.clientId || value.binding.ownerSessionId !== handle.owner.sessionId
+        || value.binding.ownerClientId !== handle.owner.clientId || value.binding.ownerSessionId !== value.owner.sessionId
         || value.binding.workspaceId !== handle.owner.workspaceId)) {
         return err(appError('PERMISSION_DENIED', 'Repository import native binding does not match its owner or attempt'));
       }
       if (value.version === 2) {
         const original = value.originalInput;
         const directory = this.importDirectory(requestId);
-        const expected = durableShellNativeBinding({
-          mutationKind: 'repository_import', taskId: handle.taskId, executable: process.execPath,
-          arguments: [path.join(directory, 'worker.cjs'), path.join(directory, 'spec.json'), value.requestDigest, value.manifestDigest],
-          cwd: directory, timeoutSeconds: 900, maxOutputBytes: 4096, includeStdout: true, includeStderr: false, owner: handle.owner,
+        const expectedArguments = [path.join(directory, 'worker.cjs'), path.join(directory, 'spec.json'), value.requestDigest, value.manifestDigest];
+        const bindingFor = (executable: string): NativeAttemptBinding => durableShellNativeBinding({
+          mutationKind: 'repository_import', taskId: handle.taskId, executable,
+          arguments: expectedArguments, cwd: directory, timeoutSeconds: 900, maxOutputBytes: 4096,
+          includeStdout: true, includeStderr: false, owner: value.owner,
         });
-        if (!original || manifestIntegrityDigest(value) !== value.manifestDigest
+        let expected = bindingFor(value.launchExecutable ?? process.execPath);
+        if (value.launchExecutable === undefined && value.binding.requestDigest !== expected.requestDigest) {
+          // An older manifest did not retain launchExecutable. Recover a candidate
+          // solely from the exact durable worker spec, then recompute the original
+          // digest. Never launch this executable or accept it as native authority.
+          const candidate = await this.taskStore.legacyRepositoryImportExecutable(value.binding, expectedArguments, directory);
+          if (candidate !== undefined) expected = bindingFor(candidate);
+        }
+        if (!original || (value.launchExecutable !== undefined && (typeof value.launchExecutable !== 'string' || !path.isAbsolute(value.launchExecutable)))
+          || manifestIntegrityDigest(value) !== value.manifestDigest
           || createHash('sha256').update(JSON.stringify({ input: original })).digest('hex') !== value.requestDigest
           || value.binding.requestDigest !== expected.requestDigest
+          || original.owner.clientId !== value.owner.clientId || original.owner.sessionId !== value.owner.sessionId
+          || original.owner.workspaceId !== value.owner.workspaceId || original.request.workspaceId !== value.owner.workspaceId
           || original.request.commit.toLowerCase() !== value.commit || original.request.destination !== value.destination
           || original.request.url !== value.url || original.request.requestId.toLowerCase() !== requestId
           || path.win32.normalize(original.workspaceRoot).toLowerCase() !== path.win32.normalize(value.workspaceRoot).toLowerCase()) {
@@ -280,14 +344,32 @@ export class SecureRepositoryImportRuntime {
     } catch { return false; }
   }
 
-  private async nativeReceipt(manifest: ImportManifest, command: 'prepare_import' | 'publish_import'): Promise<NativeReceipt | undefined> {
+  private async abortPreparedImport(manifest: ImportManifest, onRefusal?: (reason: string) => void, recoverLegacy = false): Promise<boolean> {
+    if (!this.nativeAuthority || manifest.version !== 2
+      || typeof manifest.stagePath !== 'string' || typeof manifest.privateHome !== 'string') return false;
+    try {
+      const result = await this.nativeAuthority.control({
+        directory: path.join(this.importDirectory(manifest.requestId), 'abort-import'),
+        binding: manifest.binding, command: 'abort_import',
+        request: { workspaceRoot: manifest.workspaceRoot, destination: manifest.destination,
+          stagePath: manifest.stagePath, privateHome: manifest.privateHome, commit: manifest.commit,
+          ...(recoverLegacy ? { recoverLegacy: true } : {}) },
+      });
+      if (result.state === 'termination_unknown') onRefusal?.(result.reason);
+      return result.state === 'control_verified' && result.command === 'abort_import'
+        && isNativeReceipt(result.result) && result.result.state === 'aborted' && result.result.commit === manifest.commit;
+    } catch { return false; }
+  }
+
+  private async nativeReceipt(manifest: ImportManifest, command: 'prepare_import' | 'publish_import' | 'abort_import'): Promise<NativeReceipt | undefined> {
     if (!this.nativeAuthority || manifest.version !== 2) return undefined;
     try {
       const result = await this.nativeAuthority.inspectControl({
         directory: path.join(this.importDirectory(manifest.requestId), command), binding: manifest.binding, command,
       });
       return result.state === 'control_verified' && isNativeReceipt(result.result)
-        && result.result.state === (command === 'prepare_import' ? 'prepared' : 'published') ? result.result : undefined;
+        && (command !== 'abort_import' || result.command === 'abort_import')
+        && result.result.state === (command === 'abort_import' ? 'aborted' : command === 'prepare_import' ? 'prepared' : 'published') ? result.result : undefined;
     } catch { return undefined; }
   }
 }
@@ -302,7 +384,7 @@ function isExists(error: unknown): boolean {
 function isNativeReceipt(value: unknown): value is NativeReceipt {
   if (typeof value !== 'object' || value === null) return false;
   const receipt = value as Record<string, unknown>;
-  return receipt.version === 2 && (receipt.state === 'prepared' || receipt.state === 'published')
+  return receipt.version === 2 && (receipt.state === 'prepared' || receipt.state === 'published' || receipt.state === 'aborted')
     && typeof receipt.nativeIdentity === 'string' && repositoryImportNativeIdentityPattern.test(receipt.nativeIdentity)
     && typeof receipt.commit === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(receipt.commit);
 }

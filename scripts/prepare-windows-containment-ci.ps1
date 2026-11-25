@@ -42,10 +42,21 @@ $actualPin = (Get-FileHash -LiteralPath (Join-Path $target 'lnwjud-containment-p
 if ($actualHelper -ne $manifest.sha256 -or $actualPin -ne $manifest.pinSha256) {
   throw 'CI_CONTAINMENT_HASH_MISMATCH'
 }
+& $installedImage service-install-preflight
+if ($LASTEXITCODE -ne 0) { throw "CI_CONTAINMENT_PREFLIGHT_FAILED: $LASTEXITCODE" }
 & $installedImage service-install
 if ($LASTEXITCODE -ne 0) { throw "CI_CONTAINMENT_INSTALL_FAILED: $LASTEXITCODE" }
 $service = Get-CimInstance Win32_Service -Filter "Name='LnwjudContainment'"
 if ($null -eq $service -or $service.State -ne 'Running' -or $service.PathName -notlike "*$installedImage*") {
   throw 'CI_CONTAINMENT_SERVICE_ATTESTATION_FAILED'
 }
+$probeDirectory = Join-Path ([IO.Path]::GetTempPath()) ('lnwjud-ci-install-preflight-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $probeDirectory | Out-Null
+$probe = Start-Process -FilePath $installedImage -ArgumentList 'service-install-preflight' -Wait -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $probeDirectory 'stdout.txt') -RedirectStandardError (Join-Path $probeDirectory 'stderr.txt')
+$probeReason = (Get-Content -LiteralPath (Join-Path $probeDirectory 'stdout.txt') -Raw).Trim()
+$afterProbe = Get-CimInstance Win32_Service -Filter "Name='LnwjudContainment'"
+if ($probe.ExitCode -ne 125 -or $probeReason -ne 'SERVICE_INSTALL_EXISTING_SERVICE_NOT_QUIESCED' -or $afterProbe.State -ne 'Running' -or $afterProbe.ProcessId -ne $service.ProcessId -or $afterProbe.PathName -ne $service.PathName) {
+  throw 'CI_CONTAINMENT_RUNNING_PREFLIGHT_NOT_FENCED'
+}
+Write-Host 'CI_CONTAINMENT_RUNNING_PREFLIGHT_REFUSED_WITHOUT_RESTART'
 Write-Host "CI_CONTAINMENT_SERVICE_READY sha256=$actualHelper"

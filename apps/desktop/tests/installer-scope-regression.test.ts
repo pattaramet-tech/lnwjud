@@ -29,6 +29,18 @@ describe('Windows installer scope regression', () => {
     expect(installerScript.indexOf('!macro customInit')).toBeLessThan(installerScript.indexOf('!macro customInstall'));
   });
 
+  it('runs candidate authority preflight before replacement and fails closed on old uninstall failure', () => {
+    const init = installerScript.slice(installerScript.indexOf('!macro customInit'), installerScript.indexOf('!macroend'));
+    expect(init).toContain('File /oname=$PLUGINSDIR\\lnwjud-install-preflight.exe');
+    expect(init).toContain('service-install-preflight');
+    expect(init).toContain('SetErrorLevel 125');
+    expect(init).toContain('Abort');
+    const check = installerScript.slice(installerScript.indexOf('!macro customUnInstallCheck'), installerScript.indexOf('!macro customUnInstallCheckCurrentUser'));
+    expect(check).toContain('${Errors}');
+    expect(check).toContain('$R0 != 0');
+    expect(check).toContain('Quit');
+  });
+
   it('keeps silent update uninstall from waiting on the user-data prompt', () => {
     const silentGuard = installerScript.indexOf('IfSilent keepData 0');
     const prompt = installerScript.indexOf('MessageBox MB_YESNO|MB_ICONQUESTION');

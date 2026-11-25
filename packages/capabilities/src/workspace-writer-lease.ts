@@ -67,6 +67,8 @@ export interface WorkspaceWriterLeasePort {
   acquire(workspaceId: string, ownerClientId: string, ownerSessionId: string, ttlSeconds: number, recoverAbandonedSameClient?: boolean): Promise<Result<WorkspaceWriterLeaseProof & { expiresAt: string }>>;
   inspect(workspaceId: string): Promise<Result<WorkspaceWriterLeaseStatus>>;
   begin(workspaceId: string, ownerClientId: string, ownerSessionId: string, callId: string, proof?: WorkspaceWriterLeaseProof): Promise<Result<{ required: boolean; generation: number }>>;
+  /** Host-authorized, terminal-only import recovery. Does not grant a writer lease. */
+  beginTerminalImportRecovery?(workspaceId: string, ownerClientId: string, ownerSessionId: string, callId: string, taskId: string, proof?: WorkspaceWriterLeaseProof): Promise<Result<{ required: false; generation: number }>>;
   heartbeat(workspaceId: string, callId: string, generation: number): Promise<void>;
   end(workspaceId: string, callId: string, generation: number): Promise<void>;
   renew(workspaceId: string, ownerClientId: string, ownerSessionId: string, proof: WorkspaceWriterLeaseProof, ttlSeconds: number): Promise<Result<{ expiresAt: string }>>;
@@ -85,8 +87,22 @@ export class SqliteWorkspaceWriterLease implements WorkspaceWriterLeasePort {
         expires_at INTEGER NOT NULL DEFAULT 0
       ); CREATE TABLE IF NOT EXISTS workspace_writer_calls (
         call_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL,
-        generation INTEGER NOT NULL, pid INTEGER NOT NULL
+        generation INTEGER NOT NULL, pid INTEGER NOT NULL, recovery_task_id TEXT
       ); CREATE INDEX IF NOT EXISTS workspace_writer_calls_workspace ON workspace_writer_calls(workspace_id)`);
+      const callColumns = db.prepare('PRAGMA table_info(workspace_writer_calls)').all() as Array<{ name: string }>;
+      if (!callColumns.some((column) => column.name === 'recovery_task_id')) {
+        db.exec('ALTER TABLE workspace_writer_calls ADD COLUMN recovery_task_id TEXT');
+      }
+      // Enforce in SQLite itself: pre-upgrade runtimes omit recovery_task_id
+      // from INSERT, so their admission must be rejected by the shared journal.
+      // Both creation and admission run inside BEGIN IMMEDIATE transactions.
+      db.exec(`CREATE TRIGGER IF NOT EXISTS workspace_writer_recovery_insert_fence
+        BEFORE INSERT ON workspace_writer_calls
+        WHEN EXISTS (SELECT 1 FROM workspace_writer_calls
+          WHERE workspace_id = NEW.workspace_id AND recovery_task_id IS NOT NULL)
+          OR (NEW.recovery_task_id IS NOT NULL AND EXISTS (SELECT 1 FROM workspace_writer_calls
+          WHERE workspace_id = NEW.workspace_id))
+        BEGIN SELECT RAISE(ABORT, 'TERMINAL_IMPORT_RECOVERY_IN_FLIGHT'); END;`);
       // Existing rows have unknown activity: do not early-recover pre-migration leases.
       const columns = db.prepare('PRAGMA table_info(workspace_writer_leases)').all() as Array<{ name: string }>;
       if (!columns.some((column) => column.name === 'last_activity_at')) {
@@ -208,6 +224,9 @@ export class SqliteWorkspaceWriterLease implements WorkspaceWriterLeasePort {
     try {
       return this.transaction((db) => {
         const row = this.row(db, workspaceId);
+        if (db.prepare('SELECT 1 FROM workspace_writer_calls WHERE workspace_id=? AND recovery_task_id IS NOT NULL').get(workspaceId)) {
+          return conflict('Terminal repository import recovery is in flight');
+        }
         if (row === undefined || row.lease_id === null) {
           if (proof !== undefined) return conflict('No active workspace writer lease accepts this proof');
           const generation = row?.generation ?? 0;
@@ -226,10 +245,32 @@ export class SqliteWorkspaceWriterLease implements WorkspaceWriterLeasePort {
     } catch { return unavailable(); }
   }
 
+  public async beginTerminalImportRecovery(workspaceId: string, clientId: string, sessionId: string, callId: string, taskId: string, proof?: WorkspaceWriterLeaseProof): Promise<Result<{ required: false; generation: number }>> {
+    if (!validIdentity(workspaceId, clientId, sessionId, callId) || !/^repository-import-[0-9a-f-]{36}$/.test(taskId)) return invalid();
+    try {
+      return this.transaction((db) => {
+        const row = this.row(db, workspaceId);
+        // No lease acquisition, renewal, revocation, or global probe: this lane
+        // can only finish the exact existing terminal import through native proof.
+        if (row?.lease_id != null) {
+          if (row.owner_client_id !== clientId) return conflict('Recovery cannot cross a foreign writer lease');
+          if (row.expires_at > this.now()) {
+            if (proof === undefined || !matches(row, clientId, sessionId, proof)) return conflict('Active writer lease proof is required for recovery');
+          } else if (proof !== undefined) return conflict('Expired writer lease proof cannot authorize recovery');
+        } else if (proof !== undefined) return conflict('No active workspace writer lease accepts this proof');
+        if (!this.clearVerifiedDeadCalls(db, workspaceId)) return conflict('Prior writer invocation is live or its termination cannot be proved');
+        const generation = row?.generation ?? 0;
+        db.prepare('INSERT INTO workspace_writer_calls(call_id,workspace_id,generation,pid,recovery_task_id) VALUES(?,?,?,?,?)')
+          .run(callId, workspaceId, generation, process.pid, taskId);
+        return ok({ required: false as const, generation });
+      });
+    } catch { return unavailable(); }
+  }
+
   public async heartbeat(workspaceId: string, callId: string, generation: number): Promise<void> {
     this.transaction((db) => {
       const row = this.row(db, workspaceId);
-      const tracked = db.prepare('SELECT call_id FROM workspace_writer_calls WHERE call_id=? AND workspace_id=? AND generation=?').get(callId, workspaceId, generation);
+      const tracked = db.prepare('SELECT call_id FROM workspace_writer_calls WHERE call_id=? AND workspace_id=? AND generation=? AND recovery_task_id IS NULL').get(callId, workspaceId, generation);
       if (row === undefined || row.generation !== generation || row.lease_id === null || tracked === undefined) throw new Error('stale workspace writer fence');
       const now = this.now();
       db.prepare('UPDATE workspace_writer_leases SET expires_at=?,last_activity_at=? WHERE workspace_id=? AND generation=?')

@@ -2,6 +2,11 @@ name: Dev Windows Installer
 
 on:
   workflow_dispatch:
+    inputs:
+      native_replacement_acceptance:
+        description: Run disposable native replacement matrix instead of ordinary installer smoke
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -12,6 +17,7 @@ concurrency:
 
 jobs:
   build:
+    if: ${{ !inputs.native_replacement_acceptance }}
     runs-on: windows-latest
 
     steps:
@@ -210,3 +216,64 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+  native-replacement-acceptance:
+    if: ${{ inputs.native_replacement_acceptance }}
+    name: Disposable native replacement (${{ matrix.mode }})
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [idle, modern, legacy]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact source and disposable runner
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:GITHUB_EVENT_NAME -ne 'workflow_dispatch') { throw 'REPLACEMENT_DISPOSABLE_HOST_REQUIRED' }
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA -or $LASTEXITCODE -ne 0 -or @(git status --porcelain).Count -ne 0) { throw 'REPLACEMENT_SOURCE_NOT_CLEAN' }
+          Add-Content -Path $env:GITHUB_ENV -Value 'LNWJUD_SOURCE_DIRTY_AT_START=0'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vs) { throw 'REPLACEMENT_MSVC_UNAVAILABLE' }
+          Write-Host "REPLACEMENT_MSVC_READY $vs"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: '8.0.x'
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: 'v3.1.3'
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10.15.0
+          run_install: false
+      - name: Build actual native pin and Windows packages
+        shell: pwsh
+        env:
+          LNWJUD_COSIGN_PATH: cosign
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'REPLACEMENT_DEPENDENCIES_FAILED' }
+          pnpm build
+          if ($LASTEXITCODE -ne 0) { throw 'REPLACEMENT_BUILD_FAILED' }
+          & ./scripts/package-windows.ps1
+      - name: Run installed native service acceptance
+        shell: pwsh
+        env:
+          ACCEPTANCE_MODE: ${{ matrix.mode }}
+        run: ./scripts/test-windows-native-replacement-ci.ps1 -Mode $env:ACCEPTANCE_MODE
+      - name: Upload acceptance evidence only
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-replacement-${{ matrix.mode }}-${{ github.sha }}
+          path: ${{ runner.temp }}/lnwjud-replacement-${{ matrix.mode }}-${{ github.run_id }}/replacement-evidence.json
+          if-no-files-found: warn
+          retention-days: 7

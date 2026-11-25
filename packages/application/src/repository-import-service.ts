@@ -17,6 +17,7 @@ export interface RepositoryImportRuntimePort {
   }, signal?: AbortSignal): Promise<Result<Record<string, unknown>>>;
   status(input: { readonly taskId: string; readonly owner: RepositoryImportActor }): Promise<Result<Record<string, unknown>>>;
   cancel(input: { readonly taskId: string; readonly owner: RepositoryImportActor }): Promise<Result<Record<string, unknown>>>;
+  recoverTerminal?(input: { readonly taskId: string; readonly owner: RepositoryImportActor; readonly workspaceRoot: string }): Promise<Result<Record<string, unknown>>>;
 }
 
 /**
@@ -57,6 +58,21 @@ export class RepositoryImportService {
   async cancel(actor: FileActor, workspaceId: string, taskId: string): Promise<Result<Record<string, unknown>>> {
     const owner = this.checkedOwner(actor, workspaceId, taskId);
     return !owner.ok ? owner : this.runtime.cancel({ taskId, owner: owner.value });
+  }
+
+  /** A separate exact-action host grant, never an ordinary cross-session cancel. */
+  async recoverTerminal(actor: FileActor, workspaceId: string, taskId: string, authorization?: InvocationAuthorization): Promise<Result<Record<string, unknown>>> {
+    if (authorization?.mode !== 'standard' || authorization.source !== 'host_approval'
+      || !authorization.applicationApproved || authorization.bypassApplicationAuthorization) {
+      return err(appError('PERMISSION_REQUIRED', 'Terminal import recovery requires exact host approval'));
+    }
+    const owner = this.checkedOwner(actor, workspaceId, taskId);
+    if (!owner.ok) return owner;
+    if (!/^repository-import-[0-9a-f-]{36}$/.test(taskId)) return err(appError('INVALID_INPUT', 'Recovery task identity is invalid'));
+    const workspace = await this.workspaces.get(workspaceId);
+    if (workspace === null) return err(appError('WORKSPACE_NOT_FOUND', 'Workspace was not found'));
+    if (this.runtime.recoverTerminal === undefined) return err(appError('CONFLICT', 'Terminal import recovery is unavailable', true));
+    return this.runtime.recoverTerminal({ taskId, owner: owner.value, workspaceRoot: workspace.realRootPath });
   }
 
   private checkedOwner(actor: FileActor, workspaceId: string, taskId: string): Result<RepositoryImportActor> {

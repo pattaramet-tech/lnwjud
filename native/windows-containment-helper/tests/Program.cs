@@ -140,6 +140,12 @@ internal static class NativeTests
                 case "mcp-stdio-local-resource": return Program.Main(args).GetAwaiter().GetResult();
                 case "mcp-service-tests": ServiceMcpTests.RunAsync().GetAwaiter().GetResult(); return 0;
                 case "mcp-service-test-server": ServiceMcpTests.RunServerAsync().GetAwaiter().GetResult(); return 0;
+                case "import-recovery-fixture-server": RunImportRecoveryFixtureServerAsync(args[1]).GetAwaiter().GetResult(); return 0;
+                case "import-recovery-fixture-rpc":
+                    if (!System.Text.RegularExpressions.Regex.IsMatch(args[1], "^lnwjud-import-recovery-fixture-[0-9a-f]{32}$")) throw new IOException("Invalid test pipe");
+                    using (var reply = SendServiceRpcAsync(args[1], Encoding.UTF8.GetBytes(Console.ReadLine() ?? throw new IOException("Missing test RPC"))).GetAwaiter().GetResult())
+                        Console.WriteLine(reply.RootElement.GetRawText());
+                    return 0;
                 case "service-rpc" when Environment.GetEnvironmentVariable("LNWJUD_MCP_TEST_PIPE") is { } testPipe:
                     return ServiceMcpTests.RunRpcAsync(testPipe).GetAwaiter().GetResult();
                 case "mcp-service-zero-exit":
@@ -226,10 +232,13 @@ internal static class NativeTests
                     Directory.CreateDirectory(importRoot);
                     try
                     {
+                        TestInstallerAuthorityPreflight(importRoot);
                         TestSharedWriterImportPromotion();
                         Console.WriteLine("PASS isolated import shared-writer promotion");
                         TestServiceImportTransactions(importRoot);
                         Console.WriteLine("PASS isolated import stage, owner binding and restart persistence");
+                        TestServiceImportAbortRecovery(importRoot);
+                        Console.WriteLine("PASS isolated authenticated import abort, admission and crash recovery");
                         TestServiceImportPublicationRecovery(importRoot);
                         Console.WriteLine("PASS isolated import publication, cancellation, collision and recovery");
                         TestServiceImportRpcAsync(importRoot).GetAwaiter().GetResult();
@@ -323,6 +332,7 @@ internal static class NativeTests
             TestServiceAccessControl();
             Console.WriteLine("PASS service installer and store accept read-only ACLs and reject applicable untrusted mutation rights");
             TestServiceInstallPathValidation();
+            TestInstallerAuthorityPreflight(root);
             Console.WriteLine("PASS protected service install layout and command quoting");
             TestServiceEndpointImagePolicy(root);
             TestEndpointExit259();
@@ -343,6 +353,8 @@ internal static class NativeTests
             Console.WriteLine("PASS shared ordinary writers and exclusive import reservation promotion");
             TestServiceImportTransactions(root);
             Console.WriteLine("PASS service import transaction binds native identities and recovers publication without replay");
+            TestServiceImportAbortRecovery(root);
+            Console.WriteLine("PASS authenticated import abort, admission and crash recovery");
             TestServiceImportPublicationRecovery(root);
             Console.WriteLine("PASS interrupted native publication recovers by identity and never replays a rename or replaces a collision");
             TestImportValidationOwnerState();
@@ -702,6 +714,115 @@ internal static class NativeTests
         ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.ValidateImagePath(wrongLayout, programFiles), "SERVICE_INSTALL_LAYOUT_INVALID");
     }
 
+    private static void TestInstallerAuthorityPreflight(string root)
+    {
+        var directory = Path.Combine(root, "installer-policy");
+        var candidate = Path.Combine(directory, "candidate.exe");
+        var oldRoot = Path.Combine(directory, "old");
+        var newRoot = Path.Combine(directory, "new");
+        WindowsContainmentServiceInstaller.RequireSeparateReplacementRoots(newRoot, oldRoot);
+        ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.RequireSeparateReplacementRoots(oldRoot, oldRoot), "SERVICE_INSTALL_REPLACEMENT_LAYOUT_REFUSED");
+        ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.RequireSeparateReplacementRoots(oldRoot.ToUpperInvariant(), oldRoot), "SERVICE_INSTALL_REPLACEMENT_LAYOUT_REFUSED");
+        ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.RequireSeparateReplacementRoots(Path.Combine(oldRoot, "nested"), oldRoot), "SERVICE_INSTALL_REPLACEMENT_LAYOUT_REFUSED");
+        ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.RequireSeparateReplacementRoots(oldRoot, Path.Combine(oldRoot, "nested")), "SERVICE_INSTALL_REPLACEMENT_LAYOUT_REFUSED");
+        uint Validate(uint start, bool running, string? image = null, uint type = 16, string account = "LocalSystem", uint state = 1, uint pid = 0, uint? observedStart = null)
+            => WindowsContainmentServiceInstaller.ValidateReplacementState(candidate, start, running, image ?? candidate,
+                observedStart ?? start, type, account, state, pid);
+        if (Validate(4, false) != 0 || Validate(3, false) != 0 || Validate(3, true, state: 4, pid: 42) != 42 || Validate(2, true, state: 4, pid: 42) != 42)
+            throw new Exception("Replacement state readback returned wrong PID");
+        foreach (var refuse in new Action[] {
+            () => Validate(4, false, image: candidate + ".old"), () => Validate(4, false, observedStart: 2),
+            () => Validate(3, false, type: 32), () => Validate(3, false, account: "LocalService"),
+            () => Validate(3, false, state: 2), () => Validate(3, false, pid: 42),
+            () => Validate(3, true, state: 4, pid: 0), () => Validate(2, true, state: 1, pid: 42),
+        }) ExpectFailure<IOException>(refuse, "SERVICE_INSTALL_REPLACEMENT_CONFIG_UNVERIFIED");
+        Console.WriteLine("PASS forward replacement SCM observation contract");
+        void Check(bool allowHold = true, bool requireLedger = true, bool forward = false) =>
+            WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, allowHold, false, requireLedger, forward);
+        Check(requireLedger: false);
+        ExpectFailure<IOException>(() => Check(), "NATIVE_STORE_UNVERIFIED");
+        Directory.CreateDirectory(directory);
+        Check(requireLedger: false);
+        ExpectFailure<IOException>(() => Check(), "NATIVE_STORE_UNVERIFIED");
+        var store = Path.Combine(directory, "attempts.json");
+        WindowsContainmentServiceInstaller.WriteFreshLedger(store);
+        var freshBytes = File.ReadAllBytes(store);
+        try { WindowsContainmentServiceInstaller.WriteFreshLedger(store); throw new Exception("Existing ledger was overwritten"); }
+        catch (IOException) { }
+        if (!File.ReadAllBytes(store).AsSpan().SequenceEqual(freshBytes)) throw new Exception("Existing ledger bytes changed");
+        Check(allowHold: false);
+        var admission = new WindowsContainmentService.RemovalAdmission();
+        var verified = false;
+        using (admission.Enter())
+        {
+            ExpectFailure<IOException>(() => admission.Fence(() => verified = true), "SERVICE_REMOVE_ACTIVE_CALLS");
+            if (verified) throw new Exception("Removal checked authority while a call was active");
+        }
+        ExpectFailure<IOException>(() => admission.Fence(() => throw new IOException("TEST_IDLE_UNVERIFIED")), "TEST_IDLE_UNVERIFIED");
+        using (admission.Enter()) { }
+        admission.Fence(() => verified = true);
+        if (!verified) throw new Exception("Removal did not check authority");
+        ExpectFailure<IOException>(() => admission.Enter(), "SERVICE_REMOVE_ADMISSION_FENCED");
+        admission.Fence(() => { }); // retry after lost receipt, no unfreeze
+        ExpectFailure<IOException>(() => admission.Enter(), "SERVICE_REMOVE_ADMISSION_FENCED");
+        Console.WriteLine("PASS fresh ledger create-only and removal admission fail-closed fence");
+        File.WriteAllText(store, "{");
+        ExpectFailure<IOException>(() => Check(), "ATTEMPT_STORE_CORRUPT");
+        File.WriteAllText(store, "{\"schemaVersion\":2,\"attempts\":[]}");
+        Check();
+        var ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(store));
+        var request = NewServiceAttemptRequest("installer-policy-" + Guid.NewGuid().ToString("N"), Path.Combine(directory, "workspace"));
+        ledger.RequireRemovalIdle();
+        ledger.Prepare(request);
+        ExpectFailure<IOException>(() => ledger.RequireRemovalIdle(), "SERVICE_REMOVE_NATIVE_RESERVATION_UNVERIFIED");
+        ExpectFailure<IOException>(() => Check(), "NATIVE_RESERVATION_UNVERIFIED");
+        ledger.TryCommitDispatch(request.Identity, request.AuthenticatedCallerSid, request.OperationDigest);
+        ledger.MarkRunning(request.Identity, request.AuthenticatedCallerSid, Environment.ProcessId);
+        ExpectFailure<IOException>(() => Check(), "NATIVE_RESERVATION_UNVERIFIED");
+        ledger.MarkUnknown(request.Identity, request.AuthenticatedCallerSid, "TEST_UNKNOWN");
+        ExpectFailure<IOException>(() => ledger.RequireRemovalIdle(), "SERVICE_REMOVE_NATIVE_RESERVATION_UNVERIFIED");
+        ExpectFailure<IOException>(() => Check(), "NATIVE_RESERVATION_UNVERIFIED");
+        var document = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(store))!.AsObject();
+        var record = document["attempts"]!.AsArray()[0]!.AsObject();
+        record["phase"] = (int)ServiceAttemptPhase.TerminalVerified;
+        record["outcome"] = (int)ServiceProcessOutcome.Completed;
+        record["exitCode"] = 0;
+        record["activeProcesses"] = 0;
+        record["reason"] = null;
+        File.WriteAllText(store, document.ToJsonString());
+        ExpectFailure<IOException>(() => Check(), "NATIVE_RESERVATION_UNVERIFIED");
+        record["reservationHeld"] = false;
+        File.WriteAllText(store, document.ToJsonString());
+        var bytes = File.ReadAllBytes(store);
+        Check(); Check(allowHold: false);
+        if (!File.ReadAllBytes(store).AsSpan().SequenceEqual(bytes)) throw new Exception("Preflight rewrote V2");
+        document["attempts"]!.AsArray().Add(record.DeepClone());
+        File.WriteAllText(store, document.ToJsonString());
+        ExpectFailure<IOException>(() => Check(), "NATIVE_STORE_UNVERIFIED");
+        document["attempts"]!.AsArray().RemoveAt(1);
+        document["schemaVersion"] = 3;
+        File.WriteAllText(store, document.ToJsonString());
+        ExpectFailure<IOException>(() => Check(), "NATIVE_SCHEMA_FORWARD_ONLY");
+        ExpectFailure<IOException>(() => Check(allowHold: false), "NATIVE_SCHEMA_FORWARD_ONLY");
+        var v3 = File.ReadAllBytes(store);
+        Check(forward: true);
+        if (!File.ReadAllBytes(store).AsSpan().SequenceEqual(v3)) throw new Exception("Forward replacement changed V3 ledger");
+        // Genuine V2 serializers emitted false even for ordinary shared work.
+        // A mixed history must not be misclassified as missing import evidence.
+        record["request"]!.AsObject()["publicationCommitted"] = false;
+        record["request"]!.AsObject()["shared"] = true;
+        File.WriteAllText(store, document.ToJsonString());
+        Check(forward: true);
+        record["request"]!.AsObject()["importValidationPending"] = true;
+        File.WriteAllText(store, document.ToJsonString());
+        ExpectFailure<IOException>(() => Check(forward: true), "NATIVE_RESERVATION_UNVERIFIED");
+        record["request"]!.AsObject().Remove("importValidationPending");
+        document["schemaVersion"] = 4;
+        File.WriteAllText(store, document.ToJsonString());
+        ExpectFailure<IOException>(() => Check(forward: true), "ATTEMPT_STORE_CORRUPT");
+        Console.WriteLine("PASS installer missing/corrupt/active/unknown/duplicate authority refusal and terminal V2/V3/V4 forward policy");
+    }
+
     private static void TestServiceAttemptLedger()
     {
         var ledger = new ServiceAttemptLedger();
@@ -958,6 +1079,244 @@ internal static class NativeTests
         if (!reopened.Inspect(request.Identity, sid).ReservationHeld) throw new Exception("Corrupt import metadata released its reservation");
     }
 
+    private static void TestServiceImportAbortRecovery(string root)
+    {
+        var index = 0;
+        foreach (var scenario in new[] { "destination_exists", "destination_absent", "active", "unknown", "publication_gap",
+            "stage_replaced", "stage_missing", "parent_replaced", "legacy_missing", "legacy_fence_missing", "legacy_validation_missing", "legacy_boot_recovery", "validation_launch_unknown", "crash_after_abort_record" })
+        {
+            var directory = Path.Combine(root, "abort" + index++);
+            var workspace = Directory.CreateDirectory(Path.Combine(directory, "workspace")).FullName;
+            var home = Directory.CreateDirectory(Path.Combine(directory, "home")).FullName;
+            var destination = Path.Combine(workspace, "repo");
+            var stage = Path.Combine(directory, ".lnwjud-import-stage-" + Guid.NewGuid().ToString());
+            var linked = Path.Combine(directory, "linked");
+            string? repositoryBefore = null;
+            var git = Path.Combine(Path.GetPathRoot(Environment.GetFolderPath(Environment.SpecialFolder.Windows))!, "Program Files", "Git", "cmd", "git.exe");
+            var gitEnvironment = new Dictionary<string, string>(EnvironmentBlock, StringComparer.OrdinalIgnoreCase)
+            { ["GIT_CONFIG_NOSYSTEM"] = "1", ["GIT_CONFIG_GLOBAL"] = "NUL", ["GIT_TERMINAL_PROMPT"] = "0", ["GCM_INTERACTIVE"] = "never", ["GIT_OPTIONAL_LOCKS"] = "0" };
+            string Git(params string[] arguments) => ContainedProcess.Capture(git,
+                ["-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=NUL", .. arguments], home, gitEnvironment, 15000, 1024 * 1024);
+            string RepositorySnapshot() => String.Join("\n", Git("-C", destination, "rev-parse", "HEAD"),
+                Git("-C", destination, "status", "--porcelain=v1"), Git("-C", destination, "worktree", "list", "--porcelain"),
+                Git("-C", linked, "rev-parse", "HEAD"), Git("-C", linked, "status", "--porcelain=v1"),
+                File.ReadAllText(Path.Combine(linked, ".git")));
+            using var caller = WindowsIdentity.GetCurrent();
+            var sid = caller.User!.Value;
+            var request = NewServiceAttemptRequest("abort-" + scenario, ServiceAttemptLedger.GlobalReservationKey) with { AuthenticatedCallerSid = sid, Shared = true };
+            var store = Path.Combine(directory, "attempts.json");
+            var importStore = Path.Combine(directory, "imports");
+            var ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(store), importStore);
+            ledger.Prepare(request);
+            ledger.TryCommitDispatch(request.Identity, sid, request.OperationDigest);
+            ledger.MarkRunning(request.Identity, sid, Environment.ProcessId);
+            var runtime = new ServiceImportTransactionRuntime(ledger, importStore);
+            var operation = System.Text.Json.JsonSerializer.SerializeToElement(new { workspaceRoot = workspace, destination = "repo", stagePath = stage, commit = new string('a', 40), privateHome = home });
+            var explicitRecovery = false;
+            ServiceControlObservation Abort() => runtime.Control("abort_import", request.Identity, sid,
+                explicitRecovery ? JsonSerializer.SerializeToElement(new { workspaceRoot = workspace, destination = "repo", stagePath = stage, commit = new string('a', 40), privateHome = home, recoverLegacy = true }) : operation, caller.AccessToken);
+            if (scenario == "legacy_missing")
+            {
+                ledger.AcquireImportReservation(request.Identity, sid);
+                ledger.RecordTerminal(request.Identity, sid, ServiceProcessOutcome.Completed, 1, 0);
+                ExpectFailure<IOException>(() => Abort(), "SERVICE_IMPORT_TRANSACTION_MISSING");
+                if (!ledger.Inspect(request.Identity, sid).ReservationHeld) throw new Exception("Missing transaction released");
+                continue;
+            }
+            var prepared = runtime.Control("prepare_import", request.Identity, sid, operation, caller.AccessToken);
+            File.WriteAllText(Path.Combine(stage, "stage.txt"), "preserve stage");
+            if (scenario == "destination_exists" || scenario == "crash_after_abort_record")
+            {
+                Directory.CreateDirectory(destination);
+                File.WriteAllText(Path.Combine(destination, "existing.txt"), "preserve destination");
+            }
+            if (scenario == "destination_exists")
+            {
+                Git("init", "--initial-branch=dev", destination);
+                Git("-C", destination, "-c", "user.name=Native Test", "-c", "user.email=native-test@example.invalid",
+                    "commit", "--allow-empty", "-m", "existing repository");
+                Git("-C", destination, "worktree", "add", "--detach", linked, "HEAD");
+                File.WriteAllText(Path.Combine(linked, "work-in-progress.txt"), "preserve linked worktree");
+                repositoryBefore = RepositorySnapshot();
+            }
+            if (scenario == "active")
+            {
+                ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, true, false, true), "NATIVE_SCHEMA_FORWARD_ONLY");
+                ExpectFailure<IOException>(() => Abort(), "SERVICE_IMPORT_ABORT_PROOF_INCOMPLETE");
+                if (!ledger.Inspect(request.Identity, sid).ReservationHeld) throw new Exception("Active import released");
+                continue;
+            }
+            if (scenario == "unknown")
+            {
+                ledger.MarkUnknown(request.Identity, sid, "TEST_UNKNOWN");
+                ExpectFailure<IOException>(() => Abort(), "SERVICE_IMPORT_ABORT_PROOF_INCOMPLETE");
+                if (!ledger.Inspect(request.Identity, sid).ReservationHeld) throw new Exception("Unknown import released");
+                continue;
+            }
+            if (scenario == "publication_gap")
+            {
+                // PublicationCommitted persists BEFORE PublicationIntent.
+                ExpectFailure<IOException>(() => ledger.CommitImportPublication(request.Identity, sid, () => throw new IOException("TEST_GAP")), "TEST_GAP");
+            }
+            if (scenario == "validation_launch_unknown")
+                ExpectFailure<IOException>(() => ledger.StartImportValidation(request.Identity, sid, () => throw new IOException("TEST_LAUNCH_UNKNOWN")), "TEST_LAUNCH_UNKNOWN");
+            ledger.RecordTerminal(request.Identity, sid, ServiceProcessOutcome.Completed, 1, 0);
+            ExpectFailure<UnauthorizedAccessException>(() => runtime.Control("abort_import", request.Identity with { OwnerSessionId = "foreign" }, sid, operation, caller.AccessToken), "ATTEMPT_OWNER_MISMATCH");
+            ExpectFailure<UnauthorizedAccessException>(() => runtime.Control("abort_import", request.Identity with { AttemptId = "foreign" }, sid, operation, caller.AccessToken), "ATTEMPT_OWNER_MISMATCH");
+            ExpectFailure<UnauthorizedAccessException>(() => runtime.Control("abort_import", request.Identity, "S-1-5-21-9999", operation, caller.AccessToken), "ATTEMPT_OWNER_MISMATCH");
+            var changed = System.Text.Json.JsonSerializer.SerializeToElement(new { workspaceRoot = workspace, destination = "other", stagePath = stage, commit = new string('a', 40), privateHome = home });
+            ExpectFailure<IOException>(() => runtime.Control("abort_import", request.Identity, sid, changed, caller.AccessToken), "SERVICE_IMPORT_REQUEST_CONFLICT");
+            if (scenario == "stage_replaced" || scenario == "stage_missing") Directory.Move(stage, stage + "-original");
+            if (scenario == "stage_replaced") Directory.CreateDirectory(stage);
+            if (scenario == "parent_replaced")
+            {
+                Directory.Move(workspace, workspace + "-original");
+                Directory.CreateDirectory(workspace);
+            }
+            if (scenario is "legacy_fence_missing" or "legacy_validation_missing" or "legacy_boot_recovery" or "validation_launch_unknown")
+            {
+                // Isolated fixture: simulate a historical persisted attempt that
+                // predates the explicit publication fence. Re-saving must not
+                // silently convert an unknown fence into a verified false.
+                var document = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(store))!.AsObject();
+                if (scenario != "validation_launch_unknown")
+                    document["attempts"]!.AsArray()[0]!["request"]!.AsObject().Remove(scenario == "legacy_fence_missing" ? "publicationCommitted" : "importValidationPending");
+                if (scenario is "legacy_validation_missing" or "legacy_boot_recovery") document["schemaVersion"] = 2;
+                File.WriteAllText(store, document.ToJsonString());
+                ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(store), importStore);
+                ledger.RequestCancellation(request.Identity, sid);
+                ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(store), importStore);
+                runtime = new ServiceImportTransactionRuntime(ledger, importStore);
+            }
+            if (scenario is "publication_gap" or "stage_replaced" or "stage_missing" or "parent_replaced" or "legacy_fence_missing" or "legacy_validation_missing" or "validation_launch_unknown")
+            {
+                var refused = false;
+                try { Abort(); } catch (IOException) { refused = true; }
+                if (!refused || !ledger.Inspect(request.Identity, sid).ReservationHeld) throw new Exception("Unsafe abort accepted: " + scenario);
+                continue;
+            }
+            if (scenario == "legacy_boot_recovery")
+            {
+                // Upgrade preflight reads the exact V2 held record and prepared
+                // import, but neither releases it nor permits ordinary uninstall.
+                var before = File.ReadAllBytes(store);
+                var transactionPath = ServiceImportTransactionRuntime.RecordFilename(importStore, request.Identity);
+                var transactionBefore = File.ReadAllBytes(transactionPath);
+                WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, true, false, true);
+                ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, false, false, true), "NATIVE_RESERVATION_UNVERIFIED");
+                if (!File.ReadAllBytes(store).AsSpan().SequenceEqual(before)
+                    || !File.ReadAllBytes(transactionPath).AsSpan().SequenceEqual(transactionBefore))
+                    throw new Exception("Upgrade preflight altered authority");
+                File.Move(transactionPath, transactionPath + ".bak");
+                try { ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, true, false, true), "NATIVE_IMPORT_UNVERIFIED"); }
+                finally { File.Move(transactionPath + ".bak", transactionPath); }
+                Console.WriteLine("PASS installer V2 legacy hold carry-forward and uninstall refusal");
+                ExpectFailure<IOException>(() => Abort(), "SERVICE_IMPORT_LEGACY_EXPLICIT_RECOVERY_REQUIRED");
+                explicitRecovery = true;
+                var nativeBoot = Lnwjud.UpdateWorker.NativeBootIdentity.Read();
+                if (nativeBoot != Lnwjud.UpdateWorker.NativeBootIdentity.Read()) throw new Exception("Kernel boot identity is not stable");
+                var bootA = Guid.NewGuid().ToString("D");
+                var bootB = Guid.NewGuid().ToString("D");
+                using (var legacy = JsonDocument.Parse(File.ReadAllText(store)))
+                    if (legacy.RootElement.GetProperty("schemaVersion").GetInt32() != 2) throw new Exception("V2 ledger changed before feature use");
+                ledger.ReadImportBootForTest = () => Guid.Empty.ToString("D");
+                ExpectFailure<IOException>(() => Abort(), "SERVICE_IMPORT_LEGACY_BOOT_PROOF_UNAVAILABLE");
+                ledger.ReadImportBootForTest = () => bootA;
+                ExpectFailure<IOException>(() => Abort(), "SERVICE_IMPORT_LEGACY_NEW_BOOT_REQUIRED");
+                if (!ledger.Inspect(request.Identity, sid).ReservationHeld) throw new Exception("Legacy witness released hold");
+                var heldV3 = File.ReadAllBytes(store);
+                WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, true, false, true, true);
+                if (!File.ReadAllBytes(store).AsSpan().SequenceEqual(heldV3)) throw new Exception("Forward replacement changed boot witness");
+                ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(store), importStore);
+                runtime = new ServiceImportTransactionRuntime(ledger, importStore);
+                ledger.ReadImportBootForTest = () => bootA;
+                ExpectFailure<IOException>(() => Abort(), "SERVICE_IMPORT_LEGACY_NEW_BOOT_REQUIRED");
+                if (!ledger.Inspect(request.Identity, sid).ReservationHeld) throw new Exception("Same boot released hold");
+                ledger.ReadImportBootForTest = () => bootB;
+                explicitRecovery = false;
+                ExpectFailure<IOException>(() => Abort(), "SERVICE_IMPORT_LEGACY_EXPLICIT_RECOVERY_REQUIRED");
+                explicitRecovery = true;
+                var jobName = ContainedProcess.GetJobName(request.Identity.AttemptId);
+                using (var live = ContainedProcess.Start(Executable, ["sleep", "30000"], directory, false, EnvironmentBlock, jobName: jobName))
+                {
+                    ExpectFailure<IOException>(() => Abort(), "SERVICE_IMPORT_LEGACY_JOB_UNVERIFIED");
+                    if (!ledger.Inspect(request.Identity, sid).ReservationHeld) throw new Exception("Existing Job released legacy hold");
+                    live.Cancel();
+                    var wait = Stopwatch.StartNew();
+                    while (live.ActiveProcesses != 0 && wait.ElapsedMilliseconds < 5000) Thread.Sleep(10);
+                    if (live.ActiveProcesses != 0) throw new Exception("Fixture Job termination unverified");
+                }
+                ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, true, false, true), "NATIVE_SCHEMA_FORWARD_ONLY");
+                ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, false, false, true), "NATIVE_SCHEMA_FORWARD_ONLY");
+                using var witness = JsonDocument.Parse(File.ReadAllText(store));
+                if (witness.RootElement.GetProperty("schemaVersion").GetInt32() != 3) throw new Exception("Legacy witness did not upgrade schema");
+                // A mislabeled downgrade must not be accepted by the current reader either.
+                var bad = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(store))!.AsObject();
+                bad["schemaVersion"] = 2;
+                var badPath = Path.Combine(directory, "mislabeled-v2.json");
+                File.WriteAllText(badPath, bad.ToJsonString());
+                ExpectFailure<IOException>(() => new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(badPath)), "ATTEMPT_STORE_CORRUPT");
+            }
+            var next = NewServiceAttemptRequest("next-" + scenario, ServiceAttemptLedger.GlobalReservationKey) with { AuthenticatedCallerSid = sid, Shared = true };
+            ExpectFailure<IOException>(() => ledger.Prepare(next), "WRITER_RESERVATION_BUSY");
+            if (scenario == "crash_after_abort_record")
+            {
+                ServiceImportTransactionRuntime.Fault = point => { if (point == "after_abort_record") throw new IOException("TEST_ABORT_CRASH"); };
+                try { ExpectFailure<IOException>(() => Abort(), "TEST_ABORT_CRASH"); }
+                finally { ServiceImportTransactionRuntime.Fault = null; }
+                if (!ledger.Inspect(request.Identity, sid).ReservationHeld) throw new Exception("Abort fault released admission early");
+                ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(store), importStore);
+                runtime = new ServiceImportTransactionRuntime(ledger, importStore);
+                ExpectFailure<IOException>(() => runtime.Inspect("abort_import", request.Identity, sid, caller.AccessToken), "SERVICE_IMPORT_ABORT_NOT_OBSERVED");
+                var crashV3 = File.ReadAllBytes(store);
+                WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, true, false, true, true);
+                if (!File.ReadAllBytes(store).AsSpan().SequenceEqual(crashV3)) throw new Exception("Forward replacement cleared pending abort hold");
+                ExpectFailure<IOException>(() => ledger.Prepare(next), "WRITER_RESERVATION_BUSY");
+            }
+            var aborted = Abort();
+            if (aborted.Result.State != "aborted" || aborted.Result.NativeIdentity != prepared.Result.NativeIdentity
+                || ledger.Inspect(request.Identity, sid).ReservationHeld || ledger.TryCommitDispatch(request.Identity, sid, request.OperationDigest))
+                throw new Exception("Abort did not durably release exactly the terminal import");
+            var publication = System.Text.Json.JsonSerializer.SerializeToElement(new { workspaceRoot = workspace, destination = "repo", stagePath = stage, commit = new string('a', 40), privateHome = home, expectedStageIdentity = prepared.Result.NativeIdentity });
+            ExpectFailure<IOException>(() => runtime.Control("prepare_import", request.Identity, sid, operation, caller.AccessToken), "SERVICE_IMPORT_ABORTED");
+            ExpectFailure<IOException>(() => runtime.Control("publish_import", request.Identity, sid, publication, caller.AccessToken), "SERVICE_IMPORT_ABORTED");
+            var terminalV3 = File.ReadAllBytes(store);
+            var tombstonePath = ServiceImportTransactionRuntime.RecordFilename(importStore, request.Identity);
+            var tombstone = File.ReadAllBytes(tombstonePath);
+            WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, true, false, true, true);
+            if (!File.ReadAllBytes(store).AsSpan().SequenceEqual(terminalV3) || !File.ReadAllBytes(tombstonePath).AsSpan().SequenceEqual(tombstone))
+                throw new Exception("Forward replacement changed terminal proof");
+            File.Move(tombstonePath, tombstonePath + ".bak");
+            try { ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, true, false, true, true), "NATIVE_IMPORT_UNVERIFIED"); }
+            finally { File.Move(tombstonePath + ".bak", tombstonePath); }
+            ledger.Prepare(next);
+            ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(store), importStore);
+            runtime = new ServiceImportTransactionRuntime(ledger, importStore);
+            if (Abort() != aborted || runtime.Inspect("abort_import", request.Identity, sid, caller.AccessToken) != aborted
+                || !ledger.Inspect(next.Identity, sid).ReservationHeld)
+                throw new Exception("Abort replay affected another attempt or changed receipt");
+            if (scenario == "legacy_boot_recovery")
+            {
+                ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, true, false, true), "NATIVE_SCHEMA_FORWARD_ONLY");
+                ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, false, false, true), "NATIVE_SCHEMA_FORWARD_ONLY");
+                using var resultDoc = JsonDocument.Parse(File.ReadAllText(store));
+                var records = resultDoc.RootElement.GetProperty("attempts").EnumerateArray();
+                var record = records.Single(item => item.GetProperty("request").GetProperty("identity").GetProperty("attemptId").GetString() == request.Identity.AttemptId).GetProperty("request");
+                if (resultDoc.RootElement.GetProperty("schemaVersion").GetInt32() != 3
+                    || record.TryGetProperty("importValidationPending", out _)
+                    || record.GetProperty("legacyImportObservedBoot").GetString() == record.GetProperty("legacyImportVerifiedBoot").GetString())
+                    throw new Exception("Legacy proof was silently downgraded or fabricated as validation evidence");
+            }
+            if (File.ReadAllText(Path.Combine(stage, "stage.txt")) != "preserve stage") throw new Exception("Abort changed staging data");
+            if (scenario is "destination_absent" or "legacy_boot_recovery" ? Directory.Exists(destination) : File.ReadAllText(Path.Combine(destination, "existing.txt")) != "preserve destination")
+                throw new Exception("Abort changed destination");
+            if (repositoryBefore is not null && (repositoryBefore != RepositorySnapshot()
+                || File.ReadAllText(Path.Combine(linked, "work-in-progress.txt")) != "preserve linked worktree"))
+                throw new Exception("Abort changed existing Git repository or linked worktree");
+            Console.WriteLine("PASS import abort " + scenario);
+        }
+    }
+
     private static void TestServiceImportPublicationRecovery(string root)
     {
         var scenarioIndex = 0;
@@ -1100,6 +1459,7 @@ internal static class NativeTests
                 throw new Exception("Interrupted import released before native publication reconciliation");
             var reopened = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(store), importStore);
             var recovered = new ServiceImportTransactionRuntime(reopened, importStore, useCurrentUserTestLauncher: true);
+            ExpectFailure<IOException>(() => recovered.Control("abort_import", request.Identity, sid, operation, caller.AccessToken), "SERVICE_IMPORT_ABORT_PHASE_INVALID");
             if (scenario == "after_native_publish")
             {
                 Directory.CreateDirectory(stage);
@@ -1111,6 +1471,7 @@ internal static class NativeTests
                 if (!File.Exists(Path.Combine(stage, "replacement.txt"))) throw new Exception("Recovery touched a replacement staging path");
                 if (recovered.Control("publish_import", request.Identity, sid, publication, caller.AccessToken) != published)
                     throw new Exception("Published retry did not inspect its original native identity");
+                ExpectFailure<IOException>(() => recovered.Control("abort_import", request.Identity, sid, operation, caller.AccessToken), "SERVICE_IMPORT_ABORT_PHASE_INVALID");
             }
             else
             {
@@ -1144,7 +1505,7 @@ internal static class NativeTests
                 else ledger.MarkUnknown(request.Identity, request.AuthenticatedCallerSid, "TEST_UNKNOWN");
             }
             var starts = 0;
-            try { ledger.StartImportValidation(request.Identity, request.AuthenticatedCallerSid, () => ++starts); }
+            try { ledger.StartImportValidation(request.Identity, request.AuthenticatedCallerSid, () => { ++starts; throw new IOException("TEST_UNEXPECTED_LAUNCH"); }); }
             catch (IOException) { }
             if (starts != 0) throw new Exception("An inactive outer attempt launched service Git");
         }
@@ -1609,6 +1970,65 @@ internal static class NativeTests
     private static void TestServiceRpcIdentityAndReservationsAsync() =>
         TestServiceRpcIdentityAndReservationsCoreAsync().GetAwaiter().GetResult();
 
+    // Cross-language integration fixture. Compiled only into the native TEST
+    // executable; unique per-run pipe and temporary store, never installed SCM.
+    private static async Task RunImportRecoveryFixtureServerAsync(string fixtureId)
+    {
+        if (!System.Text.RegularExpressions.Regex.IsMatch(fixtureId, "^lnwjud-mcp-import-recovery-[a-zA-Z0-9]{6,32}$"))
+            throw new IOException("Invalid import recovery fixture root");
+        var root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), fixtureId));
+        using var config = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, "fixture.json")));
+        var json = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+        var identity = config.RootElement.GetProperty("identity").Deserialize<ServiceAttemptIdentity>(json) ?? throw new IOException("Missing fixture identity");
+        var request = config.RootElement.GetProperty("request");
+        var args = ServiceImportTransactionRuntime.ParseArguments(request, "prepare_import");
+        if (!String.Equals(Path.GetFullPath(args.WorkspaceRoot), Path.Combine(root, "workspace"), StringComparison.OrdinalIgnoreCase)
+            || args.Destination != "repo"
+            || !String.Equals(Path.GetDirectoryName(Path.GetFullPath(args.StagePath!)), root, StringComparison.OrdinalIgnoreCase)
+            || !String.Equals(Path.GetFullPath(args.PrivateHome!), Path.Combine(root, "home"), StringComparison.OrdinalIgnoreCase))
+            throw new IOException("Fixture paths must remain inside its temporary root");
+        Directory.CreateDirectory(args.WorkspaceRoot);
+        Directory.CreateDirectory(args.PrivateHome!);
+        var imports = Path.Combine(root, "native-imports");
+        var ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(Path.Combine(root, "native-attempts.json")), imports);
+        var pipeName = "lnwjud-import-recovery-fixture-" + Guid.NewGuid().ToString("N");
+        using var stopping = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        var server = WindowsContainmentService.RunPipeServerAsync(pipeName, ledger, stopping.Token, useCurrentUserTestLauncher: true);
+        async Task<JsonDocument> Rpc(object body) => await SendServiceRpcAsync(pipeName, JsonSerializer.SerializeToUtf8Bytes(body, json));
+        try
+        {
+            var operation = new { kind = "run_process", executable = Executable, args = new[] { "sleep", "60000" }, cwd = root,
+                timeoutMs = 60000, windowsVerbatimArguments = false, environment = EnvironmentBlock, maximumOutputBytes = 1024 };
+            foreach (var command in new[] { "prepare", "run" })
+            {
+                using var reply = await Rpc(new { protocol = 3, command, identity, reservationKey = "fixture", operation });
+                if (!reply.RootElement.GetProperty("ok").GetBoolean()) throw new IOException("Fixture launch refused: " + reply.RootElement.GetRawText());
+            }
+            using (var prepared = await Rpc(new { protocol = 3, command = "control", identity, controlCommand = "prepare_import", controlRequest = request }))
+                if (!prepared.RootElement.GetProperty("ok").GetBoolean()) throw new IOException("Fixture prepare refused: " + prepared.RootElement.GetRawText());
+            // Simulate the pre-existing destination without ever overwriting it.
+            var destination = Path.Combine(args.WorkspaceRoot, args.Destination);
+            Directory.CreateDirectory(destination);
+            File.WriteAllText(Path.Combine(destination, "existing.txt"), "preserve destination");
+            File.WriteAllText(Path.Combine(args.StagePath!, "stage.txt"), "preserve stage");
+            using (var cancelled = await Rpc(new { protocol = 3, command = "cancel", identity }))
+                if (!cancelled.RootElement.GetProperty("ok").GetBoolean()) throw new IOException("Fixture cancellation refused");
+            using var caller = WindowsIdentity.GetCurrent();
+            var sid = caller.User!.Value;
+            for (var i = 0; i < 200 && ledger.Inspect(identity, sid).Phase != ServiceAttemptPhase.TerminalVerified; i++) await Task.Delay(20);
+            var terminal = ledger.Inspect(identity, sid);
+            if (terminal.Phase != ServiceAttemptPhase.TerminalVerified || terminal.ActiveProcesses != 0 || !terminal.ReservationHeld)
+                throw new IOException("Fixture terminal hold not established");
+            Console.WriteLine("READY " + pipeName); Console.Out.Flush();
+            await Console.In.ReadLineAsync().WaitAsync(stopping.Token);
+        }
+        finally
+        {
+            stopping.Cancel();
+            try { await server.WaitAsync(TimeSpan.FromSeconds(10)); } catch (OperationCanceledException) { }
+        }
+    }
+
     private static async Task TestServiceImportRpcAsync(string root)
     {
         var directory = Path.Combine(root, "import-rpc");
@@ -1664,6 +2084,17 @@ internal static class NativeTests
             var terminal = ledger.Inspect(identity, sid);
             if (terminal.Phase != ServiceAttemptPhase.TerminalVerified || terminal.ActiveProcesses != 0 || !terminal.ReservationHeld)
                 throw new Exception("Native completion released an unpublished import transaction");
+            var abortRequest = new { workspaceRoot = workspace, destination = "repo", stagePath = stage, commit = new string('a', 40), privateHome = home };
+            using var foreignAbort = await SendServiceRpcAsync(pipeName, System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new
+            { protocol = 3, command = "control", identity = identity with { OwnerSessionId = "foreign" }, controlCommand = "abort_import", controlRequest = abortRequest }, json));
+            if (foreignAbort.RootElement.GetProperty("ok").GetBoolean() || !ledger.Inspect(identity, sid).ReservationHeld)
+                throw new Exception("Foreign RPC abort released import");
+            using var aborted = await SendServiceRpcAsync(pipeName, System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new
+            { protocol = 3, command = "control", identity, controlCommand = "abort_import", controlRequest = abortRequest }, json));
+            if (!aborted.RootElement.GetProperty("ok").GetBoolean()
+                || aborted.RootElement.GetProperty("result").GetProperty("result").GetProperty("state").GetString() != "aborted"
+                || ledger.Inspect(identity, sid).ReservationHeld || !Directory.Exists(stage) || Directory.Exists(Path.Combine(workspace, "repo")))
+                throw new Exception("Authenticated abort RPC did not preserve directories and release admission");
         }
         finally
         {

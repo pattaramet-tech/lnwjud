@@ -113,6 +113,29 @@ describe('Windows service import control boundary', () => {
       .toMatchObject({ state: 'termination_unknown' });
   });
 
+  it('accepts only bound authenticated abort evidence and exposes readback without changing state', async () => {
+    const aborted = { ...receipt, state: 'aborted' };
+    const response = { identity: binding, command: 'abort_import', verified: true, result: aborted };
+    const f = fixture(response);
+    const request = { commit: receipt.commit };
+    expect(await f.authority.control({ directory: path.resolve('attempt'), binding, command: 'abort_import', request }))
+      .toEqual({ state: 'control_verified', binding, command: 'abort_import', result: aborted });
+    expect(f.request).toHaveBeenCalledWith({ protocol: 3, command: 'control', identity: binding, controlCommand: 'abort_import', controlRequest: request });
+    expect(await f.authority.inspectControl({ directory: path.resolve('attempt'), binding, command: 'abort_import' }))
+      .toEqual({ state: 'control_verified', binding, command: 'abort_import', result: aborted });
+    for (const invalid of [
+      { ...response, identity: { ...binding, attemptId: 'foreign' } },
+      { ...response, identity: { ...binding, ownerSessionId: 'foreign' } },
+      { ...response, verified: false },
+      { ...response, command: 'publish_import' },
+      { ...response, result: { ...aborted, state: 'published' } },
+      { ...response, result: { ...aborted, commit: 'd'.repeat(40) } },
+    ]) {
+      expect(await fixture(invalid).authority.control({ directory: path.resolve('attempt'), binding, command: 'abort_import', request }))
+        .toMatchObject({ state: 'termination_unknown' });
+    }
+  });
+
   it('reads service-owned publication evidence without trusting an attempt-directory file', async () => {
     const published = { ...receipt, state: 'published' };
     const f = fixture({ identity: binding, command: 'publish_import', verified: true, result: published });

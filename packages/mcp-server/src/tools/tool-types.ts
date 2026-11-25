@@ -141,7 +141,7 @@ export interface McpApplicationServices {
   readonly search?: Pick<SearchService, 'searchFiles' | 'searchText'>;
   readonly workspaceIndex?: Pick<WorkspaceIndexService, 'indexWorkspace' | 'status' | 'startWatch' | 'stopWatch'>;
   readonly git?: Pick<GitService, 'status' | 'diff' | 'log' | 'run'>;
-  readonly repositoryImport?: Pick<RepositoryImportService, 'start' | 'status' | 'cancel'>;
+  readonly repositoryImport?: Pick<RepositoryImportService, 'start' | 'status' | 'cancel'> & Partial<Pick<RepositoryImportService, 'recoverTerminal'>>;
   readonly process?: Pick<ProcessService, 'start' | 'list' | 'status' | 'logs' | 'stop' | 'previewProjectCommand' | 'startProjectCommand'>;
   readonly codex?: Pick<CodexService, 'status' | 'run' | 'list' | 'taskStatus' | 'taskLogs' | 'stop'>;
   readonly agentSwarm?: Pick<AgentSwarmService, 'start' | 'status' | 'result' | 'cancel' | 'list'>;

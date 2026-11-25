@@ -9,6 +9,38 @@
       Abort
     ${endif}
   ${endif}
+  ; Run candidate read-only authority preflight BEFORE old uninstaller or extraction.
+  ; Existing protected installations require an elevated, independently quiesced
+  ; service. A refusal does not stop the service or remove any installed files.
+  InitPluginsDir
+  File /oname=$PLUGINSDIR\lnwjud-install-preflight.exe "${BUILD_RESOURCES_DIR}\native-containment\lnwjud-containment.exe"
+  nsExec::ExecToStack '"$PLUGINSDIR\lnwjud-install-preflight.exe" service-install-preflight'
+  Pop $0
+  Pop $1
+  ${if} $0 != 0
+    IfSilent preflightFailure 0
+    MessageBox MB_ICONSTOP|MB_OK "Native authority preflight refused ($0, $1). Run setup elevated for protected installations. An independently quiesced service and compatible ledger are required. No upgrade is authorized."
+    preflightFailure:
+    SetErrorLevel 125
+    Abort
+  ${endif}
+!macroend
+
+; Never proceed when an existing uninstaller cannot be launched or returns an
+; error. electron-builder otherwise ignores some launch failures.
+!macro customUnInstallCheck
+  ${if} ${Errors}
+    SetErrorLevel 125
+    Quit
+  ${endif}
+  ${if} $R0 != 0
+    SetErrorLevel 125
+    Quit
+  ${endif}
+!macroend
+
+!macro customUnInstallCheckCurrentUser
+  !insertmacro customUnInstallCheck
 !macroend
 
 !macro customInstall

@@ -70,6 +70,66 @@ describe('durable multi-session workspace writer lease', () => {
       .toMatchObject({ ok: true, value: { generation: 1 } });
   }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
 
+  it('journals terminal-only recovery without granting or renewing a writer lease', async () => {
+    let time = 100_000;
+    const { one, two } = await fixture(() => time);
+    const task = 'repository-import-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const first = await one.acquire('workspace', 'owner', 'old-session', 30);
+    if (!first.ok) throw new Error('lease setup failed');
+    expect(await one.beginTerminalImportRecovery('workspace', 'owner', 'new-session', 'active', task)).toMatchObject({ ok: false });
+    expect(await one.begin('workspace', 'owner', 'old-session', 'live-call', first.value)).toMatchObject({ ok: true });
+    time += 31_000;
+    expect(await two.beginTerminalImportRecovery('workspace', 'owner', 'new-session', 'blocked', task)).toMatchObject({ ok: false });
+    await one.end('workspace', 'live-call', first.value.generation);
+    expect(await two.beginTerminalImportRecovery('workspace', 'foreign', 'new-session', 'foreign', task)).toMatchObject({ ok: false });
+    expect(await two.beginTerminalImportRecovery('workspace', 'owner', 'new-session', 'stale', task, first.value)).toMatchObject({ ok: false });
+    expect(await two.beginTerminalImportRecovery('workspace', 'owner', 'new-session', 'recovery', task)).toMatchObject({ ok: true, value: { required: false, generation: 1 } });
+    expect(await one.acquire('workspace', 'owner', 'new-session', 60)).toMatchObject({ ok: false });
+    expect(await one.begin('workspace', 'owner', 'old-session', 'write', first.value)).toMatchObject({ ok: false });
+    await expect(two.heartbeat('workspace', 'recovery', 1)).rejects.toThrow();
+    expect(await one.inspect('workspace')).toMatchObject({ ok: true, value: { generation: 1, activeCalls: 1, state: 'blocked' } });
+    await two.end('workspace', 'recovery', 1);
+    expect(await one.inspect('workspace')).toMatchObject({ ok: true, value: { generation: 1, activeCalls: 0, state: 'expired' } });
+    expect(await one.acquire('workspace', 'owner', 'new-session', 60)).toMatchObject({ ok: true, value: { generation: 2 } });
+  }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
+
+  it('migrates an old SQLite schema and fences exact pre-upgrade INSERTs during recovery', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-mixed-writer-'));
+    roots.push(root);
+    const filename = path.join(root, 'fences.sqlite');
+    const old = new DatabaseSync(filename);
+    try {
+      old.exec(`CREATE TABLE workspace_writer_leases (
+        workspace_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, lease_id TEXT, token_hash TEXT,
+        owner_client_id TEXT, owner_session_id TEXT, expires_at INTEGER NOT NULL DEFAULT 0,
+        last_activity_at INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE workspace_writer_calls (call_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL,
+          generation INTEGER NOT NULL, pid INTEGER NOT NULL);`);
+      // The exact column list used by pre-upgrade begin(), including unleased calls.
+      const oldInsert = (id: string, ws: string, generation: number): unknown =>
+        old.prepare('INSERT INTO workspace_writer_calls(call_id,workspace_id,generation,pid) VALUES(?,?,?,?)')
+          .run(id, ws, generation, process.pid);
+      oldInsert('prior', 'unleased', 0);
+      const upgraded = new SqliteWorkspaceWriterLease(filename, () => 100_000);
+      expect(await upgraded.inspect('unleased')).toMatchObject({ ok: true, value: { state: 'blocked', activeCalls: 1 } });
+      const task = 'repository-import-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      expect(await upgraded.beginTerminalImportRecovery('unleased', 'owner', 'new', 'r0', task)).toMatchObject({ ok: false });
+      await upgraded.end('unleased', 'prior', 0);
+      expect(await upgraded.beginTerminalImportRecovery('unleased', 'owner', 'new', 'r0', task)).toMatchObject({ ok: true });
+      expect(() => oldInsert('old-1', 'unleased', 0)).toThrow(/TERMINAL_IMPORT_RECOVERY_IN_FLIGHT/);
+      expect(() => oldInsert('unrelated', 'another-workspace', 0)).not.toThrow();
+      const active = await upgraded.acquire('leased', 'owner', 'new', 60);
+      if (!active.ok) throw new Error('fixture lease refused');
+      expect(await upgraded.beginTerminalImportRecovery('leased', 'owner', 'new', 'r1', task, active.value)).toMatchObject({ ok: true });
+      expect(() => oldInsert('old-2', 'leased', active.value.generation)).toThrow(/TERMINAL_IMPORT_RECOVERY_IN_FLIGHT/);
+      expect(await upgraded.inspect('leased')).toMatchObject({ ok: true, value: { generation: 1, activeCalls: 1 } });
+      await upgraded.end('leased', 'r1', active.value.generation);
+      await upgraded.end('unleased', 'r0', 0);
+      expect(() => oldInsert('old-after', 'leased', active.value.generation)).not.toThrow();
+      expect(() => oldInsert('old-after2', 'unleased', 0)).not.toThrow();
+    } finally { old.close(); }
+  }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
+
   it('rejects lease proof when there is no active lease instead of silently ignoring it', async () => {
     const { one } = await fixture();
     expect(await one.begin('workspace', 'owner', 'session', 'forged-call', {

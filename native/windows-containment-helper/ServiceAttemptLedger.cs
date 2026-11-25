@@ -58,8 +58,17 @@ internal sealed record ServiceAttemptRequest(
     bool Shared = false,
     bool HoldForImport = false,
     bool CancellationRequested = false,
-    bool PublicationCommitted = false,
-    bool RegistryOnly = false);
+    // A missing legacy fence is not evidence that publication was never committed.
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    bool? PublicationCommitted = null,
+    bool RegistryOnly = false,
+    // Null is a legacy attempt without durable validation-job evidence.
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    bool? ImportValidationPending = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    string? LegacyImportObservedBoot = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    string? LegacyImportVerifiedBoot = null);
 
 internal sealed class ServiceAttemptLedger
 {
@@ -71,6 +80,8 @@ internal sealed class ServiceAttemptLedger
         internal ServiceProcessOutcome? Outcome;
         internal int? ExitCode;
         internal int? ActiveProcesses;
+        // In-memory exact Job handle; after restart only durable pending survives.
+        internal ContainedProcess? ValidationJob;
         internal string? Reason;
         internal bool ReservationHeld = true;
     }
@@ -83,6 +94,7 @@ internal sealed class ServiceAttemptLedger
     private bool unavailable;
 #if NATIVE_CONTAINMENT_TESTS
     internal Action? AfterImportHoldClearedForTest { get; set; }
+    internal Func<string>? ReadImportBootForTest { get; set; }
 #endif
 
     internal ServiceAttemptLedger() { }
@@ -136,6 +148,18 @@ internal sealed class ServiceAttemptLedger
                 throw new IOException("ATTEMPT_STORE_CORRUPT");
         }
         if (recovered) Persist();
+    }
+
+    internal void RequireRemovalIdle()
+    {
+        lock (gate)
+        {
+            EnsureAvailable();
+            if (attempts.Values.Any(entry => entry.ReservationHeld || entry.Request.HoldForImport
+                || entry.Request.ImportValidationPending == true
+                || entry.Phase is not (ServiceAttemptPhase.TerminalVerified or ServiceAttemptPhase.LaunchNotStarted)))
+                throw new IOException("SERVICE_REMOVE_NATIVE_RESERVATION_UNVERIFIED");
+        }
     }
 
     internal ServiceAttemptObservation Prepare(ServiceAttemptRequest request)
@@ -366,10 +390,11 @@ internal sealed class ServiceAttemptLedger
         {
             var entry = Require(identity, callerSid);
             if (entry.Request.CancellationRequested) throw new IOException("SERVICE_IMPORT_CANCELLED");
-            if (entry.Request.HoldForImport) return;
             if (!entry.ReservationHeld || entry.Phase is not (ServiceAttemptPhase.DispatchCommitted or ServiceAttemptPhase.Running))
                 throw new IOException("ATTEMPT_IMPORT_PHASE_INVALID");
-            var exclusive = entry.Request with { ReservationKey = GlobalReservationKey, Shared = false, HoldForImport = true };
+            if (entry.Request.HoldForImport) return;
+            if (entry.Request.PublicationCommitted == true) throw new IOException("SERVICE_IMPORT_PUBLICATION_ALREADY_COMMITTED");
+            var exclusive = entry.Request with { ReservationKey = GlobalReservationKey, Shared = false, HoldForImport = true, PublicationCommitted = false, ImportValidationPending = false };
             if (HasConflict(exclusive, identity.AttemptId)) throw new IOException("WRITER_RESERVATION_BUSY");
             entry.Request = exclusive;
             Persist();
@@ -393,12 +418,34 @@ internal sealed class ServiceAttemptLedger
         }
     }
 
-    internal T StartImportValidation<T>(ServiceAttemptIdentity identity, string callerSid, Func<T> start)
+    internal ContainedProcess StartImportValidation(ServiceAttemptIdentity identity, string callerSid, Func<ContainedProcess> start)
     {
         lock (gate)
         {
-            EnsureImportMayValidate(Require(identity, callerSid));
-            return start();
+            var entry = Require(identity, callerSid);
+            EnsureImportMayValidate(entry);
+            if (entry.Request.ImportValidationPending != false) throw new IOException("SERVICE_IMPORT_VALIDATION_PROOF_INCOMPLETE");
+            // Persist before any independent child can be launched. A crash or
+            // uncertain launch leaves the global reservation held.
+            entry.Request = entry.Request with { ImportValidationPending = true };
+            Persist();
+            var child = start();
+            entry.ValidationJob = child;
+            return child;
+        }
+    }
+
+    internal void CompleteImportValidation(ServiceAttemptIdentity identity, string callerSid, ContainedProcess child)
+    {
+        lock (gate)
+        {
+            var entry = Require(identity, callerSid);
+            if (!entry.Request.HoldForImport || entry.Request.ImportValidationPending != true
+                || !ReferenceEquals(entry.ValidationJob, child) || child.ActiveProcesses != 0)
+                throw new IOException("SERVICE_IMPORT_VALIDATION_PROOF_INCOMPLETE");
+            entry.Request = entry.Request with { ImportValidationPending = false };
+            Persist();
+            entry.ValidationJob = null;
         }
     }
 
@@ -413,6 +460,7 @@ internal sealed class ServiceAttemptLedger
         {
             var entry = Require(identity, callerSid);
             EnsureImportMayValidate(entry);
+            if (entry.Request.ImportValidationPending != false) throw new IOException("SERVICE_IMPORT_VALIDATION_PROOF_INCOMPLETE");
             entry.Request = entry.Request with { PublicationCommitted = true };
             Persist();
             persistIntent();
@@ -424,7 +472,97 @@ internal sealed class ServiceAttemptLedger
         if (entry.Request.CancellationRequested) throw new IOException("SERVICE_IMPORT_CANCELLED");
         if (entry.Phase is not (ServiceAttemptPhase.DispatchCommitted or ServiceAttemptPhase.Running)
             || !entry.ReservationHeld || !entry.Request.HoldForImport) throw new IOException("SERVICE_IMPORT_OWNER_NOT_RUNNING");
-        if (entry.Request.PublicationCommitted) throw new IOException("SERVICE_IMPORT_PUBLICATION_ALREADY_COMMITTED");
+        if (entry.Request.PublicationCommitted != false) throw new IOException("SERVICE_IMPORT_PUBLICATION_ALREADY_COMMITTED");
+    }
+
+    // Persist the import tombstone before atomically clearing the two ledger
+    // hold flags. A retry may finish a durable tombstone, never a mere intent.
+    internal void AbortImportReservation(ServiceAttemptIdentity identity, string callerSid, bool alreadyAborted, Action persistAbort, bool recoverLegacy)
+    {
+        lock (gate)
+        {
+            var entry = Require(identity, callerSid);
+            EnsureImportAbortBaseProof(entry);
+            if (entry.Request.ImportValidationPending is null && entry.ReservationHeld && !recoverLegacy)
+                throw new IOException("SERVICE_IMPORT_LEGACY_EXPLICIT_RECOVERY_REQUIRED");
+            if (!alreadyAborted && entry.Request.HoldForImport && entry.ReservationHeld
+                && entry.Request.ImportValidationPending is null && entry.Request.LegacyImportVerifiedBoot is null)
+                RecordLegacyImportBootProof(entry);
+            EnsureImportAbortProof(entry);
+            if (!entry.Request.HoldForImport || !entry.ReservationHeld)
+            {
+                if (alreadyAborted && !entry.Request.HoldForImport && !entry.ReservationHeld) return;
+                throw new IOException("SERVICE_IMPORT_ABORT_HOLD_INVALID");
+            }
+            if (!alreadyAborted) persistAbort();
+            entry.Request = entry.Request with { HoldForImport = false };
+            entry.ReservationHeld = false;
+            Persist();
+        }
+    }
+
+    internal void VerifyImportAbortReleased(ServiceAttemptIdentity identity, string callerSid)
+    {
+        lock (gate)
+        {
+            var entry = Require(identity, callerSid);
+            EnsureImportAbortProof(entry);
+            if (entry.Request.HoldForImport || entry.ReservationHeld)
+                throw new IOException("SERVICE_IMPORT_ABORT_NOT_OBSERVED");
+        }
+    }
+
+    private void RecordLegacyImportBootProof(Entry entry)
+    {
+        // Observe the terminal held attempt on this kernel boot. Only a later
+        // distinct kernel boot proves that untracked legacy validation Jobs
+        // cannot survive. Never use caller timestamps, a service restart or PID guesses.
+        if (persistence is null) throw new IOException("SERVICE_IMPORT_LEGACY_BOOT_PROOF_UNAVAILABLE");
+        string boot;
+        try
+        {
+#if NATIVE_CONTAINMENT_TESTS
+            boot = ReadImportBootForTest?.Invoke() ?? Lnwjud.UpdateWorker.NativeBootIdentity.Read();
+#else
+            boot = Lnwjud.UpdateWorker.NativeBootIdentity.Read();
+#endif
+        }
+        catch { throw new IOException("SERVICE_IMPORT_LEGACY_BOOT_PROOF_UNAVAILABLE"); }
+        if (!ValidBootId(boot)) throw new IOException("SERVICE_IMPORT_LEGACY_BOOT_PROOF_UNAVAILABLE");
+        if (entry.Request.LegacyImportObservedBoot is null)
+        {
+            entry.Request = entry.Request with { LegacyImportObservedBoot = boot };
+            Persist();
+            throw new IOException("SERVICE_IMPORT_LEGACY_NEW_BOOT_REQUIRED");
+        }
+        if (String.Equals(entry.Request.LegacyImportObservedBoot, boot, StringComparison.OrdinalIgnoreCase))
+            throw new IOException("SERVICE_IMPORT_LEGACY_NEW_BOOT_REQUIRED");
+        if (ContainedProcess.QueryJob(ContainedProcess.GetJobName(entry.Request.Identity.AttemptId)).Status != ContainedProcess.JobProbeStatus.NotFound)
+            throw new IOException("SERVICE_IMPORT_LEGACY_JOB_UNVERIFIED");
+        entry.Request = entry.Request with { LegacyImportVerifiedBoot = boot };
+        Persist();
+    }
+
+    private static bool ValidBootId(string? value) => Guid.TryParseExact(value, "D", out var id) && id != Guid.Empty;
+
+    internal static bool HasLegacyBootProof(ServiceAttemptRequest request) => request.ImportValidationPending is null
+        && ValidBootId(request.LegacyImportObservedBoot) && ValidBootId(request.LegacyImportVerifiedBoot)
+        && !String.Equals(request.LegacyImportObservedBoot, request.LegacyImportVerifiedBoot, StringComparison.OrdinalIgnoreCase);
+
+    private static void EnsureImportAbortProof(Entry entry)
+    {
+        EnsureImportAbortBaseProof(entry);
+        if (entry.Request.ImportValidationPending != false && !HasLegacyBootProof(entry.Request))
+            throw new IOException("SERVICE_IMPORT_ABORT_PROOF_INCOMPLETE");
+    }
+
+    private static void EnsureImportAbortBaseProof(Entry entry)
+    {
+        if (entry.Phase != ServiceAttemptPhase.TerminalVerified || entry.ActiveProcesses != 0
+            || entry.Outcome is null || entry.ExitCode is null || entry.Request.PublicationCommitted != false
+            || entry.Request.RegistryOnly || entry.Request.Shared
+            || !String.Equals(entry.Request.ReservationKey, GlobalReservationKey, StringComparison.OrdinalIgnoreCase))
+            throw new IOException("SERVICE_IMPORT_ABORT_PROOF_INCOMPLETE");
     }
 
     internal void CompleteImportReservation(ServiceAttemptIdentity identity, string callerSid)
@@ -432,6 +570,7 @@ internal sealed class ServiceAttemptLedger
         lock (gate)
         {
             var entry = Require(identity, callerSid);
+            if (entry.Request.ImportValidationPending == true) throw new IOException("SERVICE_IMPORT_VALIDATION_PROOF_INCOMPLETE");
             if (entry.Request.HoldForImport)
             {
                 entry.Request = entry.Request with { HoldForImport = false };
@@ -572,7 +711,7 @@ internal sealed class ServiceAttemptLedger
         entry.Reason,
         entry.ReservationHeld,
         entry.Request.CancellationRequested,
-        entry.Request.PublicationCommitted);
+        entry.Request.PublicationCommitted == true);
 
     private static bool SameRequest(ServiceAttemptRequest left, ServiceAttemptRequest right) =>
         left.Identity == right.Identity
@@ -595,6 +734,9 @@ internal sealed class ServiceAttemptLedger
             || !Path.IsPathFullyQualified(request.ReservationKey)
             || request.HoldForImport && request.Shared
             || request.RegistryOnly != IsMcp(identity) || request.RegistryOnly && (!request.Shared || request.HoldForImport)
+            || (request.LegacyImportObservedBoot is not null && (!ValidBootId(request.LegacyImportObservedBoot)
+                || request.ImportValidationPending is not null || request.PublicationCommitted != false))
+            || (request.LegacyImportVerifiedBoot is not null && !HasLegacyBootProof(request))
             || !Digest.IsMatch(request.OperationDigest))
             throw new IOException("ATTEMPT_REQUEST_INVALID");
     }
@@ -630,13 +772,14 @@ internal sealed class ServiceAttemptLedger
         if (unavailable) throw new IOException("ATTEMPT_STORE_UNAVAILABLE");
     }
 
-    private static void ValidateStored(PersistedServiceAttempt stored)
+    internal static void ValidateStored(PersistedServiceAttempt stored)
     {
         if (stored is null) throw new IOException("ATTEMPT_STORE_CORRUPT");
         try { Validate(stored.Request); }
         catch { throw new IOException("ATTEMPT_STORE_CORRUPT"); }
         if (!Enum.IsDefined(stored.Phase)
             || (stored.Outcome is not null && !Enum.IsDefined(stored.Outcome.Value))
+            || (stored.Request.LegacyImportObservedBoot is not null && stored.Phase != ServiceAttemptPhase.TerminalVerified)
             || (stored.TargetPid is <= 0)
             || (stored.Reason is { Length: > 128 })
             || (stored.Phase == ServiceAttemptPhase.Running && stored.TargetPid is null)

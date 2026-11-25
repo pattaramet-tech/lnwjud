@@ -106,6 +106,14 @@ jobs:
           dotnet run --project native/windows-containment-helper/tests/ContainmentNativeTests.csproj -c Release --no-build --no-restore
           if ($LASTEXITCODE -ne 0) { throw 'CI_NATIVE_TESTS_FAILED' }
 
+      - name: Test Windows repository import recovery through MCP and native service
+        if: matrix.name == 'Windows'
+        shell: pwsh
+        run: |
+          $env:LNWJUD_NATIVE_IMPORT_RECOVERY_FIXTURE = (Resolve-Path native/windows-containment-helper/tests/bin/Release/net8.0/win-x64/ContainmentNativeTests.exe).Path
+          pnpm exec vitest run packages/mcp-server/src/repository-import-recovery.integration.test.ts --fileParallelism=false
+          if ($LASTEXITCODE -ne 0) { throw 'CI_NATIVE_IMPORT_RECOVERY_INTEGRATION_FAILED' }
+
       - name: Test published Windows update worker failure boundaries
         if: matrix.name == 'Windows'
         shell: pwsh

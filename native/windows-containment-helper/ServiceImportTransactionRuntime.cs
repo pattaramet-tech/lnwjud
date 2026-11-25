@@ -12,10 +12,13 @@ namespace Lnwjud.Containment;
 
 internal sealed record ServiceImportReceipt(int Version, string State, string NativeIdentity, string Commit);
 internal sealed record ServiceControlObservation(ServiceAttemptIdentity Identity, string Command, ServiceImportReceipt Result, bool Verified = true);
-internal sealed record ServiceImportArguments(string WorkspaceRoot, string Destination, string? StagePath, string Commit, string? PrivateHome, string? ExpectedStageIdentity = null);
-internal enum ServiceImportPhase { CreatingStage, Prepared, PublicationIntent, Published }
+internal sealed record ServiceImportArguments(string WorkspaceRoot, string Destination, string? StagePath, string Commit, string? PrivateHome, string? ExpectedStageIdentity = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? RecoverLegacy = null);
+internal enum ServiceImportPhase { CreatingStage, Prepared, PublicationIntent, Published, Aborted }
 internal sealed record ServiceImportRecord(int Version, ServiceAttemptIdentity Identity, string CallerSid,
-    ServiceImportArguments Arguments, ServiceImportPhase Phase, string? ParentIdentity, string? StageIdentity);
+    ServiceImportArguments Arguments, ServiceImportPhase Phase, string? ParentIdentity, string? StageIdentity,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AbortDestinationIdentity = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] bool? AbortDestinationMissing = null);
 
 internal sealed class ServiceImportTransactionRuntime
 {
@@ -60,6 +63,12 @@ internal sealed class ServiceImportTransactionRuntime
                 var entry = existing ?? throw new IOException("SERVICE_IMPORT_TRANSACTION_MISSING");
                 if (!SamePublicationRequest(entry.Arguments, args)) throw new IOException("SERVICE_IMPORT_REQUEST_CONFLICT");
                 return InspectEntry("publish_import", entry, callerToken) with { Command = command };
+            }
+            if (command == "abort_import")
+            {
+                var entry = existing ?? throw new IOException("SERVICE_IMPORT_TRANSACTION_MISSING");
+                if (entry.Arguments != args with { RecoverLegacy = null }) throw new IOException("SERVICE_IMPORT_REQUEST_CONFLICT");
+                return AbortEntry(entry, callerToken, args.RecoverLegacy == true);
             }
             if (command is not ("prepare_import" or "publish_import")) throw new IOException("SERVICE_IMPORT_COMMAND_INVALID");
             if (existing is not null && existing.Arguments != args with { ExpectedStageIdentity = null })
@@ -116,12 +125,59 @@ internal sealed class ServiceImportTransactionRuntime
     internal ServiceControlObservation Inspect(string command, ServiceAttemptIdentity identity, string callerSid, SafeAccessTokenHandle callerToken)
     {
         ValidateCaller(identity, callerSid, callerToken);
-        if (command is not ("prepare_import" or "publish_import" or "inspect_publication")) throw new IOException("SERVICE_IMPORT_COMMAND_INVALID");
+        if (command is not ("prepare_import" or "publish_import" or "inspect_publication" or "abort_import")) throw new IOException("SERVICE_IMPORT_COMMAND_INVALID");
         lock (gate) return InspectEntry(command, Load(identity, callerSid) ?? throw new IOException("SERVICE_IMPORT_TRANSACTION_MISSING"), callerToken);
+    }
+
+    private ServiceControlObservation AbortEntry(ServiceImportRecord entry, SafeAccessTokenHandle callerToken, bool recoverLegacy)
+    {
+        if (entry.Phase is not (ServiceImportPhase.Prepared or ServiceImportPhase.Aborted))
+            throw new IOException("SERVICE_IMPORT_ABORT_PHASE_INVALID");
+        if (entry.Phase == ServiceImportPhase.Aborted)
+        {
+            ledger.AbortImportReservation(entry.Identity, entry.CallerSid, true, () => throw new IOException("SERVICE_IMPORT_ABORT_REPLAY_INVALID"), recoverLegacy);
+            return Receipt("abort_import", entry);
+        }
+        ServiceImportRecord? aborted = null;
+        ledger.AbortImportReservation(entry.Identity, entry.CallerSid, false, () =>
+        {
+            RepositoryImportAnchor? destination = null;
+            RepositoryImportAnchor? stage = null;
+            try
+            {
+                WindowsIdentity.RunImpersonated(callerToken, () =>
+                {
+                    destination = new RepositoryImportAnchor(entry.Arguments.WorkspaceRoot, entry.Arguments.Destination, false);
+                    stage = new RepositoryImportAnchor(Path.GetDirectoryName(entry.Arguments.StagePath!)!, "stage", false);
+                    if (destination.ParentIdentity != entry.ParentIdentity
+                        || stage.PinAbortStage(Path.GetFileName(entry.Arguments.StagePath!)) != entry.StageIdentity)
+                        throw new IOException("SERVICE_IMPORT_ABORT_IDENTITY_CHANGED");
+                    var destinationIdentity = destination.PinAbortDestinationIdentityOrMissing();
+                    if (destinationIdentity == entry.StageIdentity) throw new IOException("SERVICE_IMPORT_ABORT_PUBLICATION_POSSIBLE");
+                    aborted = entry with { Version = 2, Phase = ServiceImportPhase.Aborted, AbortDestinationIdentity = destinationIdentity,
+                        AbortDestinationMissing = destinationIdentity is null };
+                });
+                // Persist under the service identity while the native handles
+                // remain pinned and both transaction/ledger gates are held.
+                Save(aborted!);
+#if NATIVE_CONTAINMENT_TESTS
+                Fault?.Invoke("after_abort_record");
+#endif
+            }
+            finally { stage?.Dispose(); destination?.Dispose(); }
+        }, recoverLegacy);
+        return Receipt("abort_import", aborted!);
     }
 
     private ServiceControlObservation InspectEntry(string command, ServiceImportRecord entry, SafeAccessTokenHandle callerToken)
     {
+        if (command == "abort_import")
+        {
+            if (entry.Phase != ServiceImportPhase.Aborted) throw new IOException("SERVICE_IMPORT_ABORT_NOT_OBSERVED");
+            ledger.VerifyImportAbortReleased(entry.Identity, entry.CallerSid);
+            return Receipt(command, entry);
+        }
+        if (entry.Phase == ServiceImportPhase.Aborted) throw new IOException("SERVICE_IMPORT_ABORTED");
         if (entry.Phase == ServiceImportPhase.CreatingStage) throw new IOException("SERVICE_IMPORT_PREPARATION_UNKNOWN");
         if (command == "prepare_import" && entry.Phase == ServiceImportPhase.Prepared)
         {
@@ -172,7 +228,8 @@ internal sealed class ServiceImportTransactionRuntime
         ServiceImportArguments args;
         try { args = request.Deserialize<ServiceImportArguments>(Json) ?? throw new IOException(); }
         catch { throw new IOException("SERVICE_IMPORT_REQUEST_INVALID"); }
-        if (String.IsNullOrWhiteSpace(args.WorkspaceRoot) || !Path.IsPathFullyQualified(args.WorkspaceRoot)
+        if ((args.RecoverLegacy is not null && (command != "abort_import" || args.RecoverLegacy != true))
+            || String.IsNullOrWhiteSpace(args.WorkspaceRoot) || !Path.IsPathFullyQualified(args.WorkspaceRoot)
             || String.IsNullOrWhiteSpace(args.Destination) || args.Destination.Contains('\0')
             || args.Commit is null || !Regex.IsMatch(args.Commit, "^(?:[a-f0-9]{40}|[a-f0-9]{64})$", RegexOptions.CultureInvariant))
             throw new IOException("SERVICE_IMPORT_REQUEST_INVALID");
@@ -183,7 +240,7 @@ internal sealed class ServiceImportTransactionRuntime
                 || !String.Equals(Path.GetDirectoryName(Path.GetFullPath(args.StagePath)), Path.GetDirectoryName(Path.GetFullPath(args.WorkspaceRoot)), StringComparison.OrdinalIgnoreCase)
                 || !Regex.IsMatch(Path.GetFileName(args.StagePath), "^\\.lnwjud-import-stage-[0-9a-f-]{36}$", RegexOptions.CultureInvariant)
                 || command == "publish_import" && (args.ExpectedStageIdentity is null || !NativeIdentity.IsMatch(args.ExpectedStageIdentity))
-                || command == "prepare_import" && args.ExpectedStageIdentity is not null)
+                || (command is "prepare_import" or "abort_import") && args.ExpectedStageIdentity is not null)
                 throw new IOException("SERVICE_IMPORT_REQUEST_INVALID");
         }
         return args;
@@ -193,13 +250,18 @@ internal sealed class ServiceImportTransactionRuntime
         stored.WorkspaceRoot == requested.WorkspaceRoot && stored.Destination == requested.Destination && stored.Commit == requested.Commit;
 
     private static ServiceControlObservation Receipt(string command, ServiceImportRecord entry) => new(entry.Identity, command,
-        new ServiceImportReceipt(2, command == "prepare_import" ? "prepared" : "published", entry.StageIdentity!, entry.Arguments.Commit));
+        new ServiceImportReceipt(2, command == "abort_import" ? "aborted" : command == "prepare_import" ? "prepared" : "published", entry.StageIdentity!, entry.Arguments.Commit));
 
-    private string Filename(ServiceAttemptIdentity identity) => Path.Combine(storeDirectory!, Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity.AttemptId))).ToLowerInvariant() + ".json");
+    internal static string RecordFilename(string directory, ServiceAttemptIdentity identity) => Path.Combine(directory, Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity.AttemptId))).ToLowerInvariant() + ".json");
+    private string Filename(ServiceAttemptIdentity identity) => RecordFilename(storeDirectory!, identity);
 
     private ServiceImportRecord? Load(ServiceAttemptIdentity identity, string callerSid)
     {
-        var filename = Filename(identity);
+        return ReadRecord(Filename(identity), identity, callerSid);
+    }
+
+    internal static ServiceImportRecord? ReadRecord(string filename, ServiceAttemptIdentity identity, string callerSid)
+    {
         EnsurePlainPath(filename);
         if (!File.Exists(filename)) return null;
         ServiceImportRecord entry;
@@ -208,7 +270,13 @@ internal sealed class ServiceImportTransactionRuntime
             using var stream = new FileStream(filename, FileMode.Open, FileAccess.Read, FileShare.Read);
             if (stream.Length is < 2 or > 131072) throw new IOException();
             entry = JsonSerializer.Deserialize<ServiceImportRecord>(stream, Json) ?? throw new IOException();
-            if (entry.Version != 1 || !Enum.IsDefined(entry.Phase)
+            if (entry.Version is not (1 or 2) || !Enum.IsDefined(entry.Phase)
+                || (entry.Version == 2) != (entry.Phase == ServiceImportPhase.Aborted)
+                || (entry.Phase == ServiceImportPhase.Aborted
+                    ? entry.AbortDestinationMissing is null
+                      || entry.AbortDestinationMissing.Value != (entry.AbortDestinationIdentity is null)
+                      || entry.AbortDestinationIdentity is not null && (!NativeIdentity.IsMatch(entry.AbortDestinationIdentity) || entry.AbortDestinationIdentity == entry.StageIdentity)
+                    : entry.AbortDestinationMissing is not null || entry.AbortDestinationIdentity is not null)
                 || entry.Arguments != ParseArguments(JsonSerializer.SerializeToElement(entry.Arguments, Json), "prepare_import")
                 || entry.Phase != ServiceImportPhase.CreatingStage && (entry.StageIdentity is null || !NativeIdentity.IsMatch(entry.StageIdentity)
                     || entry.ParentIdentity is null || !NativeIdentity.IsMatch(entry.ParentIdentity))) throw new IOException();
@@ -268,6 +336,8 @@ internal sealed class ServiceImportTransactionRuntime
         var child = ledger.StartImportValidation(identity, callerSid, Start);
         using (child)
         {
+          try
+          {
             output.DisposeLocalCopyOfClientHandle();
             error.DisposeLocalCopyOfClientHandle();
             var stdout = Task.Run(() => ReadBounded(output));
@@ -299,6 +369,16 @@ internal sealed class ServiceImportTransactionRuntime
                 throw new IOException("SERVICE_IMPORT_VALIDATION_FAILED");
             }
             return new UTF8Encoding(false, true).GetString(stdout.GetAwaiter().GetResult());
+          }
+          finally
+          {
+            // Do not treat Kill-on-close as observed termination. Keep durable
+            // pending proof on cancellation/query failure or service crash.
+            if (child.ActiveProcesses != 0) child.Cancel();
+            var deadline = Stopwatch.StartNew();
+            while (child.ActiveProcesses != 0 && deadline.ElapsedMilliseconds < 10000) Thread.Sleep(10);
+            ledger.CompleteImportValidation(identity, callerSid, child);
+          }
         }
     }
 

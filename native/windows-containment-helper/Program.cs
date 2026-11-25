@@ -49,6 +49,13 @@ internal static class Program
 #endif
 #if !NATIVE_CONTAINMENT_TESTS
             if (args.Length == 1 && args[0] == "service") { WindowsContainmentService.Run(); return 0; }
+            if (args.Length == 3 && args[0] is "service-replace" or "service-replace-preflight")
+            {
+                WindowsContainmentServiceInstaller.Replace(args[1], args[2], preflightOnly: args[0] == "service-replace-preflight");
+                Console.WriteLine(args[0] == "service-replace-preflight" ? "SERVICE_REPLACEMENT_PREFLIGHT_VERIFIED" : "SERVICE_REPLACEMENT_VERIFIED");
+                return 0;
+            }
+            if (args.Length == 1 && args[0] == "service-install-preflight") { WindowsContainmentServiceInstaller.PreflightInstallation(); return 0; }
             if (args.Length == 1 && args[0] == "service-install") { WindowsContainmentServiceInstaller.Install(); return 0; }
             if (args.Length == 1 && args[0] == "service-uninstall") { WindowsContainmentServiceInstaller.Uninstall(); return 0; }
 #endif
@@ -83,9 +90,9 @@ internal static class Program
                 try { Console.WriteLine(rpcFailure); }
                 catch { }
             }
-            if (args.Length == 1 && (args[0] == "service-install" || args[0] == "service-uninstall"))
+            if ((args.Length == 3 && args[0] is "service-replace" or "service-replace-preflight") || (args.Length == 1 && (args[0] == "service-install-preflight" || args[0] == "service-install" || args[0] == "service-uninstall")))
             {
-                try { Console.WriteLine(ServiceFailureReason(failure, args[0] == "service-install")); }
+                try { Console.WriteLine(ServiceFailureReason(failure, args[0] != "service-uninstall")); }
                 catch { /* Preserve the nonzero failure when stdout is unavailable. */ }
             }
             Console.Error.WriteLine("NATIVE_CONTAINMENT_UNRESOLVED");

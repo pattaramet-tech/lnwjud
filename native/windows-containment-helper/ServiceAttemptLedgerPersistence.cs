@@ -23,7 +23,9 @@ internal sealed record ServiceAttemptLedgerDocument(int SchemaVersion, Persisted
 /// </summary>
 internal sealed class ServiceAttemptLedgerPersistence
 {
-    private const int SchemaVersion = 2;
+    // V3 adds validation-job evidence. Readers that only understand V2 must
+    // refuse rather than drop evidence. Never downgrade an authoritative store.
+    private const int SchemaVersion = 3;
     private const int MaximumStoreBytes = 32 * 1024 * 1024;
     private const int MaximumAttempts = 100_000;
     private static readonly JsonSerializerOptions Json = new()
@@ -33,6 +35,8 @@ internal sealed class ServiceAttemptLedgerPersistence
     };
 
     private readonly string filename;
+    private int loadedSchemaVersion = 2;
+    internal int LoadedSchemaVersion => loadedSchemaVersion;
     internal string OutputStoreDirectory => Path.Combine(Path.GetDirectoryName(filename)!, "output");
 
     internal ServiceAttemptLedgerPersistence(string filename)
@@ -57,9 +61,11 @@ internal sealed class ServiceAttemptLedgerPersistence
             stream.CopyTo(memory);
             var document = JsonSerializer.Deserialize<ServiceAttemptLedgerDocument>(memory.ToArray(), Json)
                 ?? throw new InvalidDataException("ATTEMPT_STORE_EMPTY");
-            if (document.SchemaVersion is not (1 or SchemaVersion) || document.Attempts is null || document.Attempts.Length > MaximumAttempts
-                || document.SchemaVersion == 1 && document.Attempts.Any(attempt => attempt.Request.RegistryOnly))
+            if (document.SchemaVersion is not (1 or 2 or SchemaVersion) || document.Attempts is null || document.Attempts.Length > MaximumAttempts
+                || document.SchemaVersion == 1 && document.Attempts.Any(attempt => attempt.Request.RegistryOnly)
+                || document.SchemaVersion < 3 && document.Attempts.Any(attempt => HasV3Evidence(attempt.Request)))
                 throw new InvalidDataException("ATTEMPT_STORE_SCHEMA_INVALID");
+            loadedSchemaVersion = Math.Max(loadedSchemaVersion, document.SchemaVersion);
             return document.Attempts;
         }
         catch (Exception exception) when (exception is JsonException or InvalidDataException or IOException or UnauthorizedAccessException or ArgumentException)
@@ -68,11 +74,16 @@ internal sealed class ServiceAttemptLedgerPersistence
         }
     }
 
+    private static bool HasV3Evidence(ServiceAttemptRequest request) => request.ImportValidationPending is not null
+        || request.LegacyImportObservedBoot is not null || request.LegacyImportVerifiedBoot is not null;
+
     internal void Save(IReadOnlyCollection<PersistedServiceAttempt> attempts)
     {
         if (attempts.Count > MaximumAttempts) throw new IOException("ATTEMPT_HISTORY_LIMIT");
         EnsureNoReparsePoints(filename);
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(new ServiceAttemptLedgerDocument(SchemaVersion, attempts.ToArray()), Json);
+        // Preserve V2 until the first V3 feature write, then never downgrade.
+        var version = loadedSchemaVersion == SchemaVersion || attempts.Any(attempt => HasV3Evidence(attempt.Request)) ? SchemaVersion : 2;
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(new ServiceAttemptLedgerDocument(version, attempts.ToArray()), Json);
         if (bytes.Length > MaximumStoreBytes) throw new IOException("ATTEMPT_STORE_SIZE_LIMIT");
         var temporary = filename + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
@@ -85,6 +96,7 @@ internal sealed class ServiceAttemptLedgerPersistence
             File.Move(temporary, filename, true);
             EnsureNoReparsePoints(filename);
             if (!File.ReadAllBytes(filename).AsSpan().SequenceEqual(bytes)) throw new IOException("ATTEMPT_STORE_READBACK_FAILED");
+            loadedSchemaVersion = version;
         }
         finally
         {

@@ -507,6 +507,7 @@ export class ToolRegistry {
       const { activeRoutedInput, mutationDecision, mutationWorkspaceId, activeWorkspaceScope,
         policyAllowsScopedDestructive, hostApprovalRequired, permissionDecision } = assessed.value;
       const mutationFenceWorkspaceId = mutationWorkspaceId ?? activeWorkspaceScope?.workspaceId ?? activityWorkspaceId;
+      const terminalImportRecovery = isTerminalRepositoryImportRecovery(tool.name, activeRoutedInput);
       const codingMutation = mutationDecision.kind !== 'read' && isCodingMutation(tool.name, activeRoutedInput);
       const isInformational = isInformationalCommandInvocation(tool.name, activeRoutedInput);
       const engineeringGuardedMutation = mutationDecision.kind !== 'read'
@@ -687,7 +688,23 @@ export class ToolRegistry {
         this.services.goalRequestCancellation?.admitRecoveredGeneration?.(goalLease.goalId, goalLease.leaseGeneration);
         this.activity.bindVerifiedGoal(callId, goalLease.goalId);
       }
-      if (mutationDecision.kind !== 'read'
+      if (terminalImportRecovery) {
+        const lease = this.services.workspaceWriterLease;
+        const taskId = isRecord(approvalExecutionInput) ? readTrimmedString(approvalExecutionInput.taskId) : undefined;
+        if (fullBypass || !hostApprovalRequired || policyAllowsScopedDestructive || mutationFenceWorkspaceId === undefined
+          || taskId === undefined || lease?.beginTerminalImportRecovery === undefined) {
+          const message = 'Terminal import recovery requires exact host approval and recovery-specific writer admission';
+          await this.activity.end(callId, 'PERMISSION_DENIED', Date.now() - started, message);
+          return mapError(appError('PERMISSION_DENIED', message));
+        }
+        const admitted = await lease.beginTerminalImportRecovery(mutationFenceWorkspaceId, this.actor.clientId,
+          this.sessionId ?? this.actor.sessionId ?? this.actor.clientId, callId, taskId, writerLease);
+        if (!admitted.ok) {
+          await this.activity.end(callId, admitted.error.code, Date.now() - started, admitted.error.message);
+          return mapError(admitted.error);
+        }
+        workspaceWriterLeaseEnd = (): Promise<void> => lease.end(mutationFenceWorkspaceId, callId, admitted.value.generation);
+      } else if (mutationDecision.kind !== 'read'
         && mutationFenceWorkspaceId !== undefined
         && !WORKSPACE_WRITER_LEASE_CONTROL_TOOLS.has(tool.name)
         && !GOAL_AND_CONTINUATION_CONTROL_TOOLS.has(tool.name)
@@ -1033,6 +1050,8 @@ export class ToolRegistry {
     }
     const prohibitedReason = fullBypass ? undefined : prohibitedInvocationReason(tool.name, activeRoutedInput);
     if (prohibitedReason !== undefined) return err(appError('PERMISSION_DENIED', prohibitedReason));
+    const terminalImportRecovery = isTerminalRepositoryImportRecovery(tool.name, activeRoutedInput);
+    if (terminalImportRecovery && fullBypass) return err(appError('PERMISSION_DENIED', 'Terminal import recovery does not support Full Bypass'));
     let mutationDecision = inspectMutationOperation(tool.name, activeRoutedInput, tool.permission);
     const policy = this.destructivePolicyProvider();
     const mutationWorkspaceId = readExplicitWorkspaceId(activeRoutedInput);
@@ -1051,9 +1070,9 @@ export class ToolRegistry {
       return err(appError('PERMISSION_DENIED', nativePathScopeMismatch
         ? 'Path-bearing native target does not match the host active workspace' : 'Mutation target does not match the host active workspace'));
     }
-    const policyAllowsScopedDestructive = !fullBypass && mutationWorkspaceId !== undefined
+    const policyAllowsScopedDestructive = !terminalImportRecovery && !fullBypass && mutationWorkspaceId !== undefined
       && isScopedAutoApprovalAllowed(tool.name, activeRoutedInput, mutationDecision, policy, activeWorkspaceScope);
-    const hostApprovalRequired = !fullBypass && requiresProfileMutationConfirmation(tool.name, mutationDecision, profile);
+    const hostApprovalRequired = terminalImportRecovery || (!fullBypass && requiresProfileMutationConfirmation(tool.name, mutationDecision, profile));
     const permissionDecision = fullBypass ? 'ALLOW' : this.permissionEngine.decide(profile, {
       action: 'mcp:' + tool.name,
       level: policyAllowsScopedDestructive ? 'WRITE' : permissionLevelForMutationDecision(mutationDecision),
@@ -1838,6 +1857,13 @@ function relativePathStaysWithin(pathApi: typeof path.win32, relative: string): 
 function summarizeMutationForApproval(toolName: string, input: unknown, activeWorkspaceScope: WorkspaceScope | null): string {
   if (!isRecord(input)) return `tool = ${toolName}`;
   const lines = [`tool = ${toolName}`];
+  if (isTerminalRepositoryImportRecovery(toolName, input)) {
+    appendApprovalValue(lines, 'workspaceId', readTrimmedString(input.workspaceId));
+    appendApprovalValue(lines, 'workspaceRoot', activeWorkspaceScope?.rootPath);
+    appendApprovalValue(lines, 'taskId', readTrimmedString(input.taskId));
+    lines.push('Terminal-only native import abort; exact original owner binding; no launch, live cancellation, directory modification or lease grant.');
+    return boundedApprovalSummary(lines);
+  }
   if (toolName === 'mcp_call') {
     appendApprovalValue(lines, 'server', readTrimmedString(input.server));
     appendApprovalValue(lines, 'childTool', readTrimmedString(input.tool));
@@ -2023,6 +2049,10 @@ function requiresAlwaysConfirmation(toolName: string, decision: MutationPolicyDe
   if (reason.includes('outside the host active project')) return true;
   if (!reason.startsWith('command-risk:')) return false;
   return /delete|remove|discard|destructive|encoded|dynamically constructed|force|purge|clean|reset|restore|\brm\b|in-place|truncate|shred|overwrite/.test(reason);
+}
+
+function isTerminalRepositoryImportRecovery(toolName: string, input: unknown): boolean {
+  return toolName === 'git_clone_cancel' && isRecord(input) && input.recoverTerminal === true;
 }
 
 function requiresProfileMutationConfirmation(toolName: string, decision: MutationPolicyDecision, profile: PermissionProfile): boolean {

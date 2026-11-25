@@ -1594,6 +1594,31 @@ describe('MCP tool registry', () => {
     expect(editFile).toHaveBeenCalledTimes(1);
   });
 
+  it('does not let terminal import recovery bypass Engineering or Goal admission', async () => {
+    const recoverTerminal = vi.fn(async () => ok({ state: 'cancelled' }));
+    const beginTerminalImportRecovery = vi.fn(async () => ok({ required: false as const, generation: 1 }));
+    const hostMutationApprovalProvider = vi.fn(async () => true);
+    const input = { workspaceId: 'workspace-a', taskId: 'repository-import-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      recoverTerminal: true, userConfirmed: true };
+    const options = { sessionId: 'reconnect', profileProvider: () => permissionProfiles.full, hostMutationApprovalProvider,
+      activeWorkspaceScopeProvider: () => ({ workspaceId: 'workspace-a', rootPath: process.cwd() }) };
+    const common = { repositoryImport: { recoverTerminal } as never, workspaceWriterLease: { beginTerminalImportRecovery } as never };
+    const guarded = new ToolRegistry({ ...common,
+      engineeringPreparation: { prepare: async () => ok({ policy: { enabled: true, policyDigest: 'guard' } }) } as never,
+      goals: {} as never,
+    }, actor, options);
+    expect(await guarded.invoke('git_clone_cancel', input)).toMatchObject({ isError: true, structuredContent: { error: { code: 'ENGINEERING_PREFLIGHT_REQUIRED' } } });
+    const begin = vi.fn();
+    const goal = new ToolRegistry({ ...common, goalMutationFence: {
+      inspectWorkspaceFence: async () => ok({ goalId: 'existing-goal', leaseGeneration: 2 }), begin,
+    } as never }, actor, options);
+    expect(await goal.invoke('git_clone_cancel', input)).toMatchObject({ isError: true, structuredContent: { error: { code: 'CONFLICT' } } });
+    expect(begin).not.toHaveBeenCalled();
+    expect(hostMutationApprovalProvider).not.toHaveBeenCalled();
+    expect(beginTerminalImportRecovery).not.toHaveBeenCalled();
+    expect(recoverTerminal).not.toHaveBeenCalled();
+  });
+
   it('requires Engineering preflight for enabled coding mutations when Full Bypass is off', async () => {
     const editFile = vi.fn(async () => ok({ path: 'src/app.ts', replacements: 1, bytesWritten: 1, checkpointId: 'checkpoint-1' }));
     const prepare = vi.fn(async () => ok({ policy: { enabled: true, policyDigest: 'digest-1' } } as never));

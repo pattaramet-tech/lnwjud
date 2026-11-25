@@ -63,6 +63,44 @@ internal static class WindowsContainmentService
         ServiceAttemptIdentity? Connection = null, ServiceMcpHandles? McpHandles = null, JsonElement? Update = null);
     private sealed record RpcResponse(int Protocol, bool Ok, object? Result, string? Error);
 
+    // The maintenance request is separate from ordinary RPC admission. The
+    // fence is process-local and irreversible until this service exits; it
+    // neither cancels nor waits for active calls. SCM must subsequently prove
+    // the same running PID and disable restart before requesting stop.
+    internal sealed class RemovalAdmission
+    {
+        private readonly object gate = new();
+        private int active;
+        private bool fenced;
+        internal IDisposable Enter()
+        {
+            lock (gate)
+            {
+                if (fenced) throw new IOException("SERVICE_REMOVE_ADMISSION_FENCED");
+                active++;
+                return new Lease(this);
+            }
+        }
+        internal void Fence(Action verifyIdle)
+        {
+            lock (gate)
+            {
+                if (active != 0) throw new IOException("SERVICE_REMOVE_ACTIVE_CALLS");
+                verifyIdle();
+                fenced = true;
+            }
+        }
+        private sealed class Lease(RemovalAdmission owner) : IDisposable
+        {
+            private RemovalAdmission? admission = owner;
+            public void Dispose()
+            {
+                var current = Interlocked.Exchange(ref admission, null);
+                if (current is not null) lock (current.gate) current.active--;
+            }
+        }
+    }
+
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "StartServiceCtrlDispatcherW")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool StartServiceCtrlDispatcher([In] ServiceTableEntry[] serviceTable);
@@ -108,6 +146,7 @@ internal static class WindowsContainmentService
         ArgumentNullException.ThrowIfNull(ledger);
         var runtime = new WindowsServiceProcessRuntime(ledger, useCurrentUserTestLauncher);
         var imports = new ServiceImportTransactionRuntime(ledger, ledger.ImportStoreDirectory, useCurrentUserTestLauncher);
+        var removalAdmission = new RemovalAdmission();
         try
         {
             var workers = new List<Task>();
@@ -132,7 +171,7 @@ internal static class WindowsContainmentService
                 try
                 {
                     await pipe.WaitForConnectionAsync(cancellationToken).ConfigureAwait(false);
-                    workers.Add(HandleClientAndDisposeAsync(pipe, ledger, runtime, imports, startup, cancellationToken));
+                    workers.Add(HandleClientAndDisposeAsync(pipe, ledger, runtime, imports, startup, removalAdmission, cancellationToken));
                 }
                 catch
                 {
@@ -151,7 +190,7 @@ internal static class WindowsContainmentService
     }
 
     private static async Task HandleClientAndDisposeAsync(NamedPipeServerStream pipe, ServiceAttemptLedger ledger, WindowsServiceProcessRuntime runtime,
-        ServiceImportTransactionRuntime imports, UpdateStartupGate? startup, CancellationToken serviceStopping)
+        ServiceImportTransactionRuntime imports, UpdateStartupGate? startup, RemovalAdmission removalAdmission, CancellationToken serviceStopping)
     {
         using (pipe)
         using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(serviceStopping))
@@ -165,7 +204,7 @@ internal static class WindowsContainmentService
                 {
                     request = JsonSerializer.Deserialize<RpcRequest>(requestBytes, Json)
                         ?? throw new IOException("SERVICE_REQUEST_INVALID");
-                    if (request.Command is "update_startup" or "update_opaque" or "update_capabilities")
+                    if (request.Command is "update_startup" or "update_opaque" or "update_capabilities" or "maintenance_remove")
                     {
                         using var envelope = JsonDocument.Parse(requestBytes);
                         if (envelope.RootElement.EnumerateObject().Count() != 2)
@@ -178,6 +217,24 @@ internal static class WindowsContainmentService
                 if (request.Command is "update_enroll" or "update_prepare") timeout.CancelAfter(TimeSpan.FromSeconds(180));
 
                 using var caller = AuthenticatedPipeCaller.Capture(pipe);
+                if (request.Command == "maintenance_remove")
+                {
+                    using var identity = new WindowsIdentity(caller.PrimaryToken.DangerousGetHandle());
+                    if (!new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
+                        throw new IOException("SERVICE_REMOVE_ADMIN_REQUIRED");
+                    removalAdmission.Fence(() =>
+                    {
+                        if (startup is null || startup.Inspect().Kind != "unmanaged"
+                            || UpdateStartupGate.HasPrivateAuthority(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData)))
+                            throw new IOException("SERVICE_REMOVE_MANAGED_AUTHORITY_REFUSED");
+                        runtime.RequireRemovalIdle();
+                        ledger.RequireRemovalIdle();
+                        WindowsContainmentServiceInstaller.VerifyProtectedStoreForReplacement(allowLegacyImportHold: false, install: false, requireLedger: true);
+                    });
+                    await WriteFrameAsync(pipe, new RpcResponse(3, true, new { kind = "removal_fenced", pid = Environment.ProcessId }, null), timeout.Token).ConfigureAwait(false);
+                    return;
+                }
+                using var admission = removalAdmission.Enter();
                 if (request.Command == "update_launch")
                 {
                     if (startup is null) throw new IOException("SERVICE_UPDATE_AUTHORITY_UNAVAILABLE");
@@ -479,7 +536,7 @@ internal static class WindowsContainmentService
         return root;
     }
 
-    private static void EnsureStoreAcl(DirectorySecurity currentSecurity)
+    internal static void EnsureStoreAcl(FileSystemSecurity currentSecurity)
     {
         var owner = currentSecurity.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
         var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
@@ -515,7 +572,11 @@ internal static class WindowsContainmentService
         {
             using var authority = ServiceEndpointIdentity.ActivateProductionService();
             var directory = EnsureStoreDirectory();
-            var ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(Path.Combine(directory, "attempts.json")), Path.Combine(directory, "imports"));
+            var ledgerPath = Path.Combine(directory, "attempts.json");
+            ServiceAttemptLedgerPersistence.EnsureNoReparsePoints(ledgerPath);
+            if (!File.Exists(ledgerPath)) throw new IOException("SERVICE_STORE_LEDGER_MISSING");
+            EnsureStoreAcl(new FileInfo(ledgerPath).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access));
+            var ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(ledgerPath), Path.Combine(directory, "imports"));
             SetStatus(ServiceRunning, AcceptStop, 0);
             RunProductionPipeServerAsync(authority, ledger, directory, stopping.Token).GetAwaiter().GetResult();
             SetStatus(ServiceStopped, 0, 0);

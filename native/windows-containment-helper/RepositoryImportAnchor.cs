@@ -36,6 +36,7 @@ internal sealed class RepositoryImportAnchor : IDisposable {
  SafeFileHandle stage;
  SafeFileHandle guard;
  SafeFileHandle parent;
+ SafeFileHandle destinationProbe;
  readonly uint volumeSerial;
  readonly string parentPath;
  enum AnchorState { Anchored, Prepared, Published, Disposed }
@@ -111,7 +112,7 @@ internal sealed class RepositoryImportAnchor : IDisposable {
   return next;
  }
 
- static SafeFileHandle OpenRelative(SafeFileHandle root,string name,bool create) {
+ static SafeFileHandle OpenRelative(SafeFileHandle root,string name,bool create,bool allowMissing=false) {
   var chars=Marshal.StringToHGlobalUni(name);
   var unicode = new UnicodeString{Length=checked((ushort)(name.Length*2)),MaximumLength=checked((ushort)(name.Length*2+2)),Buffer=chars};
   var ptr=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
@@ -122,7 +123,12 @@ internal sealed class RepositoryImportAnchor : IDisposable {
    uint access=GenericRead|Synchronize|ReadAttributes|(create?DeleteAccess:0);
    uint options=DirectorySynchronousOpenReparsePoint|(create?DeleteOnClose:0);
    uint result=NtCreateFile(out handle,access,ref attrs,out status,IntPtr.Zero,DirectoryAttribute,ShareReadWrite,create?FileCreate:FileOpen,options,IntPtr.Zero,0);
-   if(result!=0) { if(handle!=null)handle.Dispose(); throw new IOException("IMPORT_ANCHOR_REFUSED_"+result.ToString("X8")); }
+   if(result!=0) {
+    if(handle!=null)handle.Dispose();
+    // Only an exact missing leaf is absence; ACL, reparse and other errors fail closed.
+    if(allowMissing && result==0xC0000034)return null;
+    throw new IOException("IMPORT_ANCHOR_REFUSED_"+result.ToString("X8"));
+   }
    return handle;
   } finally { Marshal.FreeHGlobal(ptr);Marshal.FreeHGlobal(chars); }
  }
@@ -137,6 +143,25 @@ internal sealed class RepositoryImportAnchor : IDisposable {
   state=AnchorState.Prepared;
   publicationAccess=forPublication;
   return identity;
+ }
+
+ // Read-only, handle-relative probes for abort. Keep both handles pinned until
+ // the transaction's durable abort is committed; never create a guard or rename.
+ public string PinAbortStage(string stageName) {
+  if(state!=AnchorState.Anchored||stage!=null||!System.Text.RegularExpressions.Regex.IsMatch(stageName,@"^\.lnwjud-import-stage-[0-9a-f-]{36}$"))
+   throw new IOException("IMPORT_INVALID_STAGE");
+  stage=OpenRelative(parent,stageName,false);
+  CheckDirectory(stage);
+  if(RequireNtfs(stage)!=volumeSerial)throw new IOException("IMPORT_CROSS_VOLUME");
+  return Identity(stage);
+ }
+ public string PinAbortDestinationIdentityOrMissing() {
+  if(state!=AnchorState.Anchored||destinationProbe!=null)throw new IOException("IMPORT_ABORT_PROBE_STATE");
+  destinationProbe=OpenRelative(parent,DestinationName,false,true);
+  if(destinationProbe==null)return null;
+  CheckDirectory(destinationProbe);
+  if(RequireNtfs(destinationProbe)!=volumeSerial)throw new IOException("IMPORT_CROSS_VOLUME");
+  return Identity(destinationProbe);
  }
 
  public string ReadPublishedIdentity() {
@@ -213,6 +238,7 @@ internal sealed class RepositoryImportAnchor : IDisposable {
   if(state==AnchorState.Disposed)return;
   state=AnchorState.Disposed;
   if(stage!=null)stage.Dispose();
+  if(destinationProbe!=null)destinationProbe.Dispose();
   if(guard!=null)guard.Dispose();
   for(int i=ancestors.Count-1;i>=0;i--)ancestors[i].Dispose();
  }

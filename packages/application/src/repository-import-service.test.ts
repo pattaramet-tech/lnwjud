@@ -51,6 +51,24 @@ describe('RepositoryImportService', () => {
     expect(JSON.stringify(result)).not.toContain('secret');
     expect(workspaces.get).not.toHaveBeenCalled();
   });
+  it('requires a trusted exact host grant for terminal-only recovery, not profile, chat flag or Full Bypass', async () => {
+    const workspaceId = 'ws1';
+    const taskId = 'repository-import-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const workspaces = { get: vi.fn(async () => ({ realRootPath: 'C:\\sandbox' })) };
+    const runtime = { start: vi.fn(), status: vi.fn(), cancel: vi.fn(), recoverTerminal: vi.fn(async () => ok({ state: 'cancelled' })) };
+    const service = new RepositoryImportService(workspaces as never, runtime as never);
+    const authorization = { mode: 'standard', applicationApproved: true, bypassApplicationAuthorization: false, source: 'host_approval' } as const;
+    for (const refused of [undefined, { ...authorization, source: 'profile' as const }, { ...authorization, source: 'explicit_user' as const },
+      { ...authorization, mode: 'full_bypass' as const, bypassApplicationAuthorization: true, source: 'full_bypass' as const }]) {
+      expect(await service.recoverTerminal(actor, workspaceId, taskId, refused)).toMatchObject({ ok: false, error: { code: 'PERMISSION_REQUIRED' } });
+    }
+    expect(workspaces.get).not.toHaveBeenCalled();
+    expect(runtime.recoverTerminal).not.toHaveBeenCalled();
+    expect(await service.recoverTerminal(actor, workspaceId, taskId, authorization)).toMatchObject({ ok: true });
+    expect(runtime.recoverTerminal).toHaveBeenCalledWith({ taskId, owner: { clientId: actor.clientId, sessionId: actor.sessionId, workspaceId }, workspaceRoot: 'C:\\sandbox' });
+    expect(runtime.cancel).not.toHaveBeenCalled();
+  });
+
   it('rejects invalid handle ownership fields for status and cancellation', async () => {
     const workspaces = { get: vi.fn() };
     const runtime = { start: vi.fn(), status: vi.fn(), cancel: vi.fn() };
