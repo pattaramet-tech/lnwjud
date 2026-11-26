@@ -95,6 +95,25 @@ internal sealed class ServiceAttemptLedger
 #if NATIVE_CONTAINMENT_TESTS
     internal Action? AfterImportHoldClearedForTest { get; set; }
     internal Func<string>? ReadImportBootForTest { get; set; }
+
+    // Fixture only: serialize the final evidence check with every ledger
+    // mutation. Reject stale in-memory state instead of overwriting disk.
+    internal T WithAtomicMaintenanceFixture<T>(string store, Func<T> operation)
+    {
+        lock (gate)
+        {
+            EnsureAvailable();
+            if (persistence is null || ImportStoreDirectory != Path.Combine(store, "imports")
+                || persistence.OutputStoreDirectory != Path.Combine(store, "output"))
+                throw new IOException("ATOMIC_FIXTURE_STORE_MISMATCH");
+            var disk = persistence.Load().OrderBy(row => row.Request.Identity.AttemptId, StringComparer.Ordinal).ToArray();
+            var memory = attempts.Values.OrderBy(row => row.Request.Identity.AttemptId, StringComparer.Ordinal)
+                .Select(row => new PersistedServiceAttempt(row.Request, row.Phase, row.TargetPid,
+                    row.Outcome, row.ExitCode, row.ActiveProcesses, row.Reason, row.ReservationHeld)).ToArray();
+            if (!disk.SequenceEqual(memory)) throw new IOException("ATOMIC_FIXTURE_LEDGER_CHANGED");
+            return operation();
+        }
+    }
 #endif
 
     internal ServiceAttemptLedger() { }

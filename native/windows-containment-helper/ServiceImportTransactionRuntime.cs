@@ -53,8 +53,146 @@ internal sealed class ServiceImportTransactionRuntime
     internal ServiceControlObservation Control(string command, ServiceAttemptIdentity identity, string callerSid,
         JsonElement request, SafeAccessTokenHandle callerToken)
     {
-        ValidateCaller(identity, callerSid, callerToken);
         var args = ParseArguments(request, command);
+        // The caller's selector is not an authorization. Until a trusted local
+        // service-side grant is integrated, no production control may opt in
+        // to legacy recovery. Ordinary modern abort and readback are unchanged.
+        if (args.RecoverLegacy is not null)
+            throw new IOException("SERVICE_IMPORT_LEGACY_AUTHORIZATION_UNAVAILABLE");
+        return ControlCore(command, identity, callerSid, args, callerToken);
+    }
+
+#if NATIVE_CONTAINMENT_TESTS
+    // Direct engine regression only. Never linked into the production helper
+    // or registered in the service's RPC switch.
+    internal ServiceControlObservation ControlLegacyEngineFixture(string command, ServiceAttemptIdentity identity,
+        string callerSid, JsonElement request, SafeAccessTokenHandle callerToken)
+        => ControlCore(command, identity, callerSid, ParseArguments(request, command), callerToken);
+
+    // Never included in the installed helper. The scope guard confines this
+    // experiment to a unique temporary fixture; no alternate store is accepted.
+    internal NativeAtomicFixtureResult ApplyApprovedMaintenanceFixture(OrphanImportEvidence approved,
+        SafeAccessTokenHandle callerToken, Action verifyConsent,
+        MaintenanceBoundaryFixture? boundary = null, string? fenceDigest = null)
+    {
+        if (storeDirectory is null) throw new IOException("ATOMIC_FIXTURE_STORE_MISMATCH");
+        var store = Path.GetDirectoryName(storeDirectory)!;
+        var fixture = Path.GetDirectoryName(store)!;
+        var name = Path.GetFileName(fixture);
+        const string prefix = "lnwjud-orphan-fixture-";
+        if (Path.GetFileName(store) != "native" || Path.GetFileName(storeDirectory) != "imports"
+            || !String.Equals(Path.GetDirectoryName(fixture), Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetTempPath())), StringComparison.OrdinalIgnoreCase)
+            || !name.StartsWith(prefix, StringComparison.Ordinal)
+            || !Guid.TryParseExact(name[prefix.Length..], "N", out var fixtureId) || fixtureId == Guid.Empty)
+            throw new IOException("ATOMIC_FIXTURE_STORE_MISMATCH");
+        EnsurePlainPath(storeDirectory);
+        if ((boundary is null) != (fenceDigest is null)
+            || (boundary is null && Directory.Exists(Path.Combine(fixture, "maintenance"))))
+            throw new IOException("ATOMIC_FIXTURE_BOUNDARY_MISSING");
+        void RequireBoundary() { if (boundary is not null) boundary.RequireRecoveryFixture(fixture, fenceDigest!); }
+        RequireBoundary();
+        bool WithinFixture(string? path) => path is not null && Path.IsPathFullyQualified(path)
+            && Path.GetFullPath(path).StartsWith(fixture + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        if (!WithinFixture(approved.Arguments.WorkspaceRoot) || !WithinFixture(approved.Arguments.StagePath)
+            || !WithinFixture(approved.Arguments.PrivateHome)
+            || !WithinFixture(Path.Combine(approved.Arguments.WorkspaceRoot, approved.Arguments.Destination)))
+            throw new IOException("ATOMIC_FIXTURE_DIRECTORY_SCOPE");
+        if (ledger.ReadImportBootForTest is not null) throw new IOException("ATOMIC_FIXTURE_BOOT_OVERRIDE_REFUSED");
+
+        // Existing lock order: import transaction -> ledger. Consent occurs
+        // before acquiring either lock; final verification occurs inside both.
+        // These locks cover this ledger/runtime instance, not arbitrary OS
+        // processes or a second service. Machine exclusivity is a later gate.
+        lock (gate)
+        {
+            return ledger.WithAtomicMaintenanceFixture(store, () =>
+            {
+                var entry = Load(approved.Identity, approved.OwnerSid)
+                    ?? throw new IOException("SERVICE_IMPORT_TRANSACTION_MISSING");
+                if (entry.Arguments != approved.Arguments) throw new IOException("ATOMIC_FIXTURE_ARGUMENTS_CHANGED");
+                RepositoryImportAnchor? stage = null, destination = null;
+                string? pinnedDestination = null;
+                try
+                {
+                    WindowsIdentity.RunImpersonated(callerToken, () =>
+                    {
+                        destination = new RepositoryImportAnchor(entry.Arguments.WorkspaceRoot, entry.Arguments.Destination, false);
+                        stage = new RepositoryImportAnchor(Path.GetDirectoryName(entry.Arguments.StagePath!)!, "stage", false);
+                        if (destination.ParentIdentity != entry.ParentIdentity
+                            || stage.PinAbortStage(Path.GetFileName(entry.Arguments.StagePath!)) != entry.StageIdentity)
+                            throw new IOException("ATOMIC_FIXTURE_DIRECTORY_CHANGED");
+                        var identity = destination.PinAbortDestinationIdentityOrMissing();
+                        pinnedDestination = identity;
+                        // An absent destination cannot be pinned; deliberately
+                        // refuse this experimental lane rather than claim an
+                        // atomic absence guarantee.
+                        if (identity is null) throw new IOException("ATOMIC_FIXTURE_DESTINATION_ABSENT");
+                        if (identity == entry.StageIdentity) throw new IOException("ATOMIC_FIXTURE_PUBLICATION_POSSIBLE");
+                    });
+                    verifyConsent();
+                    // Re-read independently of the consent adapter. The
+                    // ledger/import file pins are released by preflight before
+                    // replacement; directory handles and both locks survive.
+                    var fresh = OrphanImportPreflight.InspectFixture(store, approved.Identity, callerToken, true);
+                    if (fresh != approved) throw new IOException("ATOMIC_FIXTURE_EVIDENCE_CHANGED");
+                    return ledger.WithAtomicMaintenanceFixture(store, () =>
+                    {
+                        var current = Load(approved.Identity, approved.OwnerSid);
+                        if (current != entry) throw new IOException("ATOMIC_FIXTURE_TRANSACTION_CHANGED");
+                        RequireBoundary();
+                        var ledgerPath = Path.Combine(store, "attempts.json");
+                        var recordPath = RecordFilename(storeDirectory, approved.Identity);
+                        if (approved.Action == OrphanImportAction.RecordBootWitness)
+                        {
+                            try
+                            {
+                                _ = AbortEntry(entry, callerToken, true);
+                                throw new IOException("ATOMIC_FIXTURE_BOOT_WITNESS_UNEXPECTED_RELEASE");
+                            }
+                            catch (IOException error) when (error.Message == "SERVICE_IMPORT_LEGACY_NEW_BOOT_REQUIRED")
+                            {
+                                var saved = new ServiceAttemptLedgerPersistence(ledgerPath).Load()
+                                    .Single(row => row.Request.Identity == approved.Identity);
+                                if (!saved.ReservationHeld || !saved.Request.HoldForImport
+                                    || saved.Request.LegacyImportObservedBoot != approved.BootId
+                                    || saved.Request.LegacyImportVerifiedBoot is not null
+                                    || ReadRecord(recordPath, approved.Identity, approved.OwnerSid) != entry)
+                                    throw new IOException("ATOMIC_FIXTURE_BOOT_WITNESS_READBACK_FAILED");
+                                return new NativeAtomicFixtureResult(approved.Identity, approved.Action, true, false);
+                            }
+                        }
+                        if (approved.Action is not (OrphanImportAction.AbortPreparedImport or OrphanImportAction.FinishAbortedHold)
+                            || (approved.Action == OrphanImportAction.FinishAbortedHold) != (entry.Phase == ServiceImportPhase.Aborted))
+                            throw new IOException("ATOMIC_FIXTURE_ACTION_CHANGED");
+                        if (boundary is not null)
+                        {
+                            var rows = new ServiceAttemptLedgerPersistence(ledgerPath).Load();
+                            boundary.PrepareRecoveryIntentFixture(fixture, fenceDigest!, approved,
+                                RecoveryReceiptFixture.ExpectedPost(rows, entry, approved, pinnedDestination!));
+                        }
+                        _ = AbortEntry(entry, callerToken, true);
+                        ledger.VerifyImportAbortReleased(approved.Identity, approved.OwnerSid);
+                        var released = new ServiceAttemptLedgerPersistence(ledgerPath).Load()
+                            .Single(row => row.Request.Identity == approved.Identity);
+                        var tombstone = ReadRecord(recordPath, approved.Identity, approved.OwnerSid);
+                        if (released.ReservationHeld || released.Request.HoldForImport
+                            || !ServiceAttemptLedger.HasLegacyBootProof(released.Request)
+                            || tombstone?.Phase != ServiceImportPhase.Aborted
+                            || tombstone.Arguments != approved.Arguments)
+                            throw new IOException("ATOMIC_FIXTURE_ABORT_READBACK_FAILED");
+                        return new NativeAtomicFixtureResult(approved.Identity, approved.Action, false, true);
+                    });
+                }
+                finally { stage?.Dispose(); destination?.Dispose(); }
+            });
+        }
+    }
+#endif
+
+    private ServiceControlObservation ControlCore(string command, ServiceAttemptIdentity identity, string callerSid,
+        ServiceImportArguments args, SafeAccessTokenHandle callerToken)
+    {
+        ValidateCaller(identity, callerSid, callerToken);
         lock (gate)
         {
             var existing = Load(identity, callerSid);

@@ -21,12 +21,12 @@ export function createHostWindowsNativeAuthority(dataPath: string, trustedRuntim
 }
 
 /**
- * Only a journaled update transaction may hold writable startup. An installation
- * without an enrolled update authority, or a gate that cannot be inspected, must
- * still open the application; the authority reports that state separately.
+ * Journaled update transactions, slot selection conflicts, and an authenticated
+ * native package mismatch hold writable startup. An unenrolled installation
+ * or generic inspection failure keeps the existing diagnostic startup policy.
  */
 export function updateStartupBlocksWritableStartup(reason: string): boolean {
-  return /^UPDATE_(?:TRANSACTION|SLOT_SELECTION)_/.test(reason);
+  return reason === 'UPDATE_NATIVE_PACKAGE_MISMATCH' || /^UPDATE_(?:TRANSACTION|SLOT_SELECTION)_/.test(reason);
 }
 
 export async function assertHostWindowsUpdateStartup(dataPath: string, trustedRuntimeDirectory?: string): Promise<void> {

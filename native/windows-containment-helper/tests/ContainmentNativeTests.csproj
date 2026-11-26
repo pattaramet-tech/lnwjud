@@ -14,6 +14,18 @@
     <Compile Include="../ServiceEndpointIdentity.cs" Link="ServiceEndpointIdentity.cs" />
     <Compile Include="../ServiceAttemptLedgerPersistence.cs" Link="ServiceAttemptLedgerPersistence.cs" />
     <Compile Include="../ServiceAttemptLedger.cs" Link="ServiceAttemptLedger.cs" />
+    <Compile Include="../CoordinatedUpgradeStore.cs" Link="CoordinatedUpgradeStore.cs" />
+    <Compile Include="../CoordinatedProtectedWitness.cs" Link="CoordinatedProtectedWitness.cs" />
+    <Compile Include="../CoordinatedLegacyImportWitness.cs" Link="CoordinatedLegacyImportWitness.cs" />
+    <Compile Include="../OrphanImportAuthorization.cs" Link="OrphanImportAuthorization.cs" />
+    <Compile Include="../NativeMaintenanceAuthority.cs" Link="NativeMaintenanceAuthority.cs" />
+    <Compile Include="../LocalMaintenanceUtility.cs" Link="LocalMaintenanceUtility.cs" />
+    <Compile Include="../MaintenanceBoundaryFixture.cs" Link="MaintenanceBoundaryFixture.cs" />
+    <Compile Include="../ProductionMaintenanceBoundary.cs" Link="ProductionMaintenanceBoundary.cs" />
+    <Compile Include="../NativeRecoveryAdapter.cs" Link="NativeRecoveryAdapter.cs" />
+    <Compile Include="../QualifiedRecoveryConsentFixture.cs" Link="QualifiedRecoveryConsentFixture.cs" />
+    <Compile Include="../RecoveryReceiptFixture.cs" Link="RecoveryReceiptFixture.cs" />
+    <Compile Include="../NativeRecoveryPostState.cs" Link="NativeRecoveryPostState.cs" />
     <Compile Include="../ServiceImportTransactionRuntime.cs" Link="ServiceImportTransactionRuntime.cs" />
     <Compile Include="../ContainedProcess.cs" Link="ContainedProcess.cs" />
     <Compile Include="../McpStdioProxy.cs" Link="McpStdioProxy.cs" />

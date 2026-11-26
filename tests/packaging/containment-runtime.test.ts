@@ -97,6 +97,33 @@ it('rejects replaced helper bytes even when the adjacent manifest is replaced to
   await expect(verifyContainmentArtifacts(input)).rejects.toThrow('compiled trust');
 });
 
+it('rejects a mixed Desktop, helper, pin and runtime package at every independent boundary', async () => {
+  const old = await fixture();
+  const candidate = await fixture();
+  const nextHelper = Buffer.from('candidate helper');
+  const nextPin = Buffer.from('candidate pin');
+  const nextRuntime = Buffer.from('candidate runtime');
+  const digest = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+  const manifestPath = path.join(candidate.directory, 'manifest.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  await writeFile(path.join(candidate.directory, 'lnwjud-containment.exe'), nextHelper);
+  await writeFile(path.join(candidate.directory, 'lnwjud-containment-pin.node'), nextPin);
+  await writeFile(path.join(candidate.directory, 'process-runtime.mjs'), nextRuntime);
+  await writeFile(manifestPath, JSON.stringify({ ...manifest, sha256: digest(nextHelper), pinSha256: digest(nextPin) }));
+  await writeFile(candidate.compiledBundlePath, `var CONTAINMENT_HELPER_SHA256 = '${digest(nextHelper)}';\nvar CONTAINMENT_RUNTIME_SHA256 = '${digest(nextRuntime)}';\nvar CONTAINMENT_PIN_SHA256 = '${digest(nextPin)}';\n`);
+  await expect(verifyContainmentArtifacts(candidate)).resolves.toMatchObject({ helper: { sha256: digest(nextHelper) } });
+  await expect(verifyContainmentArtifacts({ ...candidate, compiledBundlePath: old.compiledBundlePath })).rejects.toThrow();
+  await expect(verifyContainmentArtifacts({ ...old, compiledBundlePath: candidate.compiledBundlePath })).rejects.toThrow();
+  for (const filename of ['lnwjud-containment.exe', 'lnwjud-containment-pin.node', 'process-runtime.mjs']) {
+    const target = path.join(candidate.directory, filename);
+    const bytes = await readFile(target);
+    await writeFile(target, await readFile(path.join(old.directory, filename)));
+    await expect(verifyContainmentArtifacts(candidate)).rejects.toThrow(filename);
+    await writeFile(target, bytes);
+  }
+  await expect(verifyContainmentArtifacts(candidate)).resolves.toMatchObject({ helper: { sha256: digest(nextHelper) } });
+});
+
 it('rejects placeholder or missing compiled trust', async () => {
   const input = await fixture();
   await writeFile(input.compiledBundlePath, `const CONTAINMENT_RUNTIME_SHA256 = '${'0'.repeat(64)}';`);

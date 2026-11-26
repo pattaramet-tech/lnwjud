@@ -301,15 +301,14 @@ if ($held.phase -ne 4 -or -not $held.reservationHeld) { throw 'REPLACEMENT_HOLD_
 Rpc $candidate $newHash @{command='prepare';identity=$next;operation=$operation} 'WRITER_RESERVATION_BUSY'
 if ($Mode -eq 'legacy') {
     Rpc $candidate $newHash @{command='control';identity=$identity;controlCommand='abort_import';controlRequest=$arguments} 'SERVICE_IMPORT_LEGACY_EXPLICIT_RECOVERY_REQUIRED'
+    # Legacy selector is deliberately not an authorization. This hosted
+    # package test proves preservation and refusal, not interactive recovery.
     $arguments.recoverLegacy = $true
-    Rpc $candidate $newHash @{command='control';identity=$identity;controlCommand='abort_import';controlRequest=$arguments} 'SERVICE_IMPORT_LEGACY_NEW_BOOT_REQUIRED'
-    $witnessHash = Hash $ledger
-    Rpc $candidate $newHash @{command='control';identity=$identity;controlCommand='abort_import';controlRequest=$arguments} 'SERVICE_IMPORT_LEGACY_NEW_BOOT_REQUIRED'
-    if ((Hash $ledger) -ne $witnessHash -or -not (Rpc $candidate $newHash @{command='inspect';identity=$identity}).reservationHeld) { throw 'REPLACEMENT_LEGACY_SAME_BOOT_RELEASED' }
-    $witness = Get-Content -LiteralPath $ledger -Raw | ConvertFrom-Json
-    $witnessRecords = @($witness.attempts | Where-Object { $_.request.identity.attemptId -eq $identity.attemptId })
-    if ($witness.schemaVersion -ne 3 -or $witnessRecords.Count -ne 1 -or -not $witnessRecords[0].request.legacyImportObservedBoot) { throw 'REPLACEMENT_LEGACY_WITNESS_MISSING' }
-    Write-Host 'LEGACY_BOOT_WITNESS_RETAINED; ACTUAL_REBOOT_NOT_TESTED'
+    Rpc $candidate $newHash @{command='control';identity=$identity;controlCommand='abort_import';controlRequest=$arguments} 'SERVICE_IMPORT_LEGACY_AUTHORIZATION_UNAVAILABLE'
+    Rpc $candidate $newHash @{command='control';identity=$identity;controlCommand='abort_import';controlRequest=$arguments} 'SERVICE_IMPORT_LEGACY_AUTHORIZATION_UNAVAILABLE'
+    Assert-AuthorityUnchanged
+    if (-not (Rpc $candidate $newHash @{command='inspect';identity=$identity}).reservationHeld) { throw 'REPLACEMENT_LEGACY_HOLD_RELEASED' }
+    Write-Host 'LEGACY_RPC_REFUSED_AUTHORITY_PRESERVED; INTERACTIVE_RECOVERY_NOT_TESTED'
 } else {
     $aborted = Rpc $candidate $newHash @{command='control';identity=$identity;controlCommand='abort_import';controlRequest=$arguments}
     if ($aborted.result.state -ne 'aborted' -or (Rpc $candidate $newHash @{command='inspect';identity=$identity}).reservationHeld) { throw 'REPLACEMENT_ABORT_RELEASE_UNVERIFIED' }

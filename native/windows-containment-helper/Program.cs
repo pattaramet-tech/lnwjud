@@ -48,6 +48,16 @@ internal static class Program
             if (args.Length == 1 && args[0] == "mcp-stdio-proxy") return await McpStdioProxy.RunAsync().ConfigureAwait(false);
 #endif
 #if !NATIVE_CONTAINMENT_TESTS
+            if (args.Length > 0 && args[0] == "native-maintenance-review")
+            {
+                if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
+                var review = LocalMaintenanceUtility.RunReadOnly(args);
+                Console.WriteLine("NATIVE_MAINTENANCE_READ_ONLY_REVIEW_CONFIRMED");
+                Console.WriteLine(review.CooperativeBoundaryVerified
+                    ? "NATIVE_COOPERATIVE_BOUNDARY_INSPECTED_MUTATION_UNAVAILABLE"
+                    : "NATIVE_COOPERATIVE_BOUNDARY_NOT_INSPECTED_MUTATION_UNAVAILABLE");
+                return 0;
+            }
             if (args.Length == 1 && args[0] == "service") { WindowsContainmentService.Run(); return 0; }
             if (args.Length == 3 && args[0] is "service-replace" or "service-replace-preflight")
             {

@@ -445,7 +445,14 @@ class ProcessWindowsContainmentServiceClient implements WindowsContainmentServic
       const result = await this.invoke<unknown>({ protocol: 3, command: 'update_startup' });
       if (!isRecord(result) || Object.keys(result).length !== 2
         || result.kind !== 'unmanaged' || result.reason !== 'MANUAL_INSTALLATION') return result;
-    } catch { /* Only a fresh local footprint can permit an unavailable service's manual installation. */ }
+    } catch (error) {
+      // The authenticated endpoint mismatch is positive evidence of a mixed
+      // installation, not mere unavailability. Never let a manual footprint
+      // override it, including during an interrupted forward replacement.
+      if (error instanceof Error && error.message === 'SERVICE_ENDPOINT_PACKAGE_MISMATCH') {
+        return { kind: 'held', reason: 'UPDATE_NATIVE_PACKAGE_MISMATCH' };
+      }
+    }
     return this.invoke({ protocol: 3, command: 'update_startup' }, 'update-startup-footprint');
   }
   private async invoke<T>(request: WindowsContainmentRpcRequest | { readonly protocol: 3; readonly command: 'update_startup' },

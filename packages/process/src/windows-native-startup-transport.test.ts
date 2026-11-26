@@ -71,6 +71,26 @@ describe.skipIf(process.platform !== 'win32')('pinned native startup transport',
     expect(transport.spawn).toHaveBeenCalledTimes(2);
   });
 
+  it('never replaces an authenticated mixed-package refusal with a manual footprint', async () => {
+    const { authority, closes } = await fixture();
+    transport.spawn.mockImplementationOnce(() => {
+      const process = child();
+      process.stdin?.once('finish', () => queueMicrotask(() => {
+        if (process.stdout instanceof PassThrough) process.stdout.end('{"protocol":3,"ok":false,"error":"SERVICE_ENDPOINT_PACKAGE_MISMATCH"}\r\n');
+        process.stderr?.destroy();
+        process.emit('close', 125, null);
+      }));
+      return process;
+    }).mockImplementationOnce(() => {
+      const process = child();
+      reply(process, { protocol: 3, kind: 'unmanaged', reason: 'MANUAL_INSTALLATION' });
+      return process;
+    });
+    expect(await authority.inspectUpdateStartup()).toEqual({ kind: 'held', reason: 'UPDATE_NATIVE_PACKAGE_MISMATCH' });
+    expect(transport.spawn).toHaveBeenCalledTimes(1);
+    expect(await closes()).toBe(1);
+  });
+
   it('never lets a remote manual result override a local managed-slot hold', async () => {
     const { authority } = await fixture();
     transport.spawn.mockImplementationOnce(() => {

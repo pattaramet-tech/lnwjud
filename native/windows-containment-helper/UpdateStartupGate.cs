@@ -12,9 +12,12 @@ internal sealed class UpdateStartupGate : IDisposable
     private readonly string installationRoot;
     private readonly string serviceStore;
     private readonly Func<bool> machineEnrolled;
+    private readonly Func<bool> maintenancePresent;
     private readonly WindowsServiceUpdateRuntime? updates;
-    private UpdateStartupGate(string installationRoot, string serviceStore, Func<bool> machineEnrolled, WindowsServiceUpdateRuntime? updates = null)
-        => (this.installationRoot, this.serviceStore, this.machineEnrolled, this.updates) = (installationRoot, serviceStore, machineEnrolled, updates);
+    private UpdateStartupGate(string installationRoot, string serviceStore, Func<bool> machineEnrolled,
+        WindowsServiceUpdateRuntime? updates = null, Func<bool>? maintenancePresent = null)
+        => (this.installationRoot, this.serviceStore, this.machineEnrolled, this.updates, this.maintenancePresent)
+            = (installationRoot, serviceStore, machineEnrolled, updates, maintenancePresent ?? CoordinatedMaintenancePresent);
 
     internal static UpdateStartupGate Installed(ServiceEndpointIdentity.ProductionServiceAuthority owner, string serviceStore)
     {
@@ -23,8 +26,8 @@ internal sealed class UpdateStartupGate : IDisposable
     }
 
 #if NATIVE_CONTAINMENT_TESTS
-    internal static UpdateStartupGate Isolated(string install, string state, Func<bool> registrationPresent)
-        => new(install, state, registrationPresent);
+    internal static UpdateStartupGate Isolated(string install, string state, Func<bool> registrationPresent, Func<bool>? maintenancePresent = null)
+        => new(install, state, registrationPresent, maintenancePresent: maintenancePresent ?? (() => false));
 #endif
 
     internal static readonly UpdateStartupDisposition Unavailable = new("held", "UPDATE_STARTUP_INSPECTION_UNAVAILABLE");
@@ -37,8 +40,32 @@ internal sealed class UpdateStartupGate : IDisposable
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
     private static extern int RegOpenKeyExW(SafeRegistryHandle parent, string name, uint options, int access, out SafeRegistryHandle result);
 
+    internal static UpdateStartupDisposition? InspectCoordinatedMaintenance(Func<bool> present)
+    {
+        try
+        {
+            return present() ? new("held", "UPDATE_TRANSACTION_COORDINATED_MAINTENANCE") : null;
+        }
+        catch (Exception)
+        {
+            return new("held", "UPDATE_TRANSACTION_COORDINATED_INSPECTION_UNAVAILABLE");
+        }
+    }
+
+    internal static UpdateStartupDisposition? InspectMachineMaintenance()
+        => InspectCoordinatedMaintenance(CoordinatedMaintenancePresent);
+
+    internal UpdateStartupDisposition? InspectMaintenance()
+        => InspectCoordinatedMaintenance(maintenancePresent);
+
+    internal void RequireMaintenanceOpen()
+    {
+        if (InspectMaintenance() is { } held) throw new IOException(held.Reason);
+    }
+
     internal UpdateStartupDisposition Inspect()
     {
+        if (InspectMaintenance() is { } held) return held;
         try
         {
             using var install = ServiceEndpointIdentity.OpenProtected(installationRoot, directory: true);
@@ -56,7 +83,10 @@ internal sealed class UpdateStartupGate : IDisposable
 
     internal void BeforeOpaqueDispatch(string authenticatedCallerSid)
     {
+        RequireMaintenanceOpen();
         var disposition = Inspect();
+        if (disposition.Reason.StartsWith("UPDATE_TRANSACTION_COORDINATED_", StringComparison.Ordinal))
+            throw new IOException(disposition.Reason);
         if (disposition.Kind == "unmanaged") return;
         if (updates is null) throw new IOException(disposition.Reason);
         updates.BeforeOpaqueDispatch(authenticatedCallerSid);
@@ -79,6 +109,7 @@ internal sealed class UpdateStartupGate : IDisposable
 
     internal static UpdateStartupDisposition InspectFootprint()
     {
+        if (InspectMachineMaintenance() is { } held) return held;
         try
         {
             if (MachineEnrolled()) return Unverified;
@@ -166,6 +197,20 @@ internal sealed class UpdateStartupGate : IDisposable
         handle.Dispose();
         if (error == 2) return null;
         throw new IOException("SERVICE_FOOTPRINT_REGISTRY_UNAVAILABLE");
+    }
+
+    // Presence is deliberately sticky, including an incomplete or malformed
+    // registration. Only a future authenticated coordinator may publish/clear it.
+    // Query the fixed protected 64-bit key, never an environment-controlled path.
+    private static bool CoordinatedMaintenancePresent()
+    {
+        using var product = OpenMachineKey(@"SOFTWARE\lnwjud");
+        if (product is null) return false;
+        VerifyRegistryProtection(product);
+        using var marker = OpenKey(product.Handle, "CoordinatedMaintenance");
+        if (marker is null) return false;
+        VerifyRegistryProtection(marker);
+        return true;
     }
 
     private static bool MachineEnrolled()

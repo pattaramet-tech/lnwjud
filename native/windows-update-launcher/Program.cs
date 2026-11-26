@@ -19,6 +19,7 @@ internal static class Program
         {
             if (!OperatingSystem.IsWindows() || args.Length > 512 || args.Any(value => value.Length > 32767 || value.Contains('\0')))
                 throw new IOException("UPDATE_LAUNCH_ARGUMENTS_INVALID");
+            RequireMaintenanceOpen();
             var root = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
             var helperRoot = Path.Combine(root, "resources", "native-containment");
             using var helper = new FileStream(Path.Combine(helperRoot, "lnwjud-containment.exe"), FileMode.Open, FileAccess.Read, FileShare.Read);
@@ -82,6 +83,12 @@ internal static class Program
         return terminal.GetProperty("exitCode").GetInt32();
     }
 
+    private static void RequireMaintenanceOpen()
+    {
+        if (!OperatingSystem.IsWindows()) throw new IOException("UPDATE_LAUNCH_ARGUMENTS_INVALID");
+        if (UpdateStartupGate.InspectMachineMaintenance() is { } held) throw new IOException(held.Reason);
+    }
+
     private static async Task RelayInput(AnonymousPipeServerStream destination, CancellationToken token)
     {
         try { await Console.OpenStandardInput().CopyToAsync(destination, token).ConfigureAwait(false); }
@@ -90,6 +97,7 @@ internal static class Program
 
     private static async Task<int> LaunchManual(string root, string[] args)
     {
+        RequireMaintenanceOpen();
         var slot = Path.Combine(root, "slots", "A");
         var image = Path.Combine(slot, "lnwjud.exe");
         using var manifest = new FileStream(Path.Combine(slot, "manifest.json"), FileMode.Open, FileAccess.Read, FileShare.Read);
@@ -106,6 +114,7 @@ internal static class Program
         var invocation = new ProcessStartInfo(image) { UseShellExecute = false, WorkingDirectory = slot };
         foreach (var argument in args) invocation.ArgumentList.Add(argument);
         invocation.Environment["LNWJUD_UPDATE_BOOT_MODE"] = "manual";
+        RequireMaintenanceOpen();
         using var process = Process.Start(invocation) ?? throw new IOException("UPDATE_MANUAL_LAUNCH_FAILED");
         await process.WaitForExitAsync().ConfigureAwait(false);
         return process.ExitCode;

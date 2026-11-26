@@ -118,6 +118,10 @@ internal static class NativeTests
                 case "updater-crash-boundaries": UpdaterCrashBoundaryFixture.RunSuite(); return 0;
                 case "update-eligibility-tests": UpdateEligibilityTests.Run(); return 0;
                 case "native-update-transaction-tests": NativeUpdateTransactionTests.Run(); return 0;
+                case "coordinated-upgrade-tests": CoordinatedUpgradeTests.Run(); return 0;
+                case "orphan-import-authorization-tests": OrphanImportAuthorizationTests.Run(); return 0;
+                case "maintenance-boundary-tests": MaintenanceBoundaryTests.Run(); return 0;
+                case "maintenance-boundary-child": return MaintenanceBoundaryTests.Child(args);
                 case "service-error-reply-timeout": TestBoundedServiceFailureReply().GetAwaiter().GetResult(); return 0;
                 case "pipe-acl": ServicePipeSecurityTests.Run(); return 0;
                 case "authenticated-pipe-caller": TestAuthenticatedPipeCallerCapture(); return 0;
@@ -736,7 +740,28 @@ internal static class NativeTests
             () => Validate(3, false, state: 2), () => Validate(3, false, pid: 42),
             () => Validate(3, true, state: 4, pid: 0), () => Validate(2, true, state: 1, pid: 42),
         }) ExpectFailure<IOException>(refuse, "SERVICE_INSTALL_REPLACEMENT_CONFIG_UNVERIFIED");
-        Console.WriteLine("PASS forward replacement SCM observation contract");
+        void Startup(string raw)
+        {
+            using var document = JsonDocument.Parse(raw);
+            WindowsContainmentServiceInstaller.RequireReplacementStartupReceipt(document.RootElement);
+        }
+        Startup("""{"protocol":3,"ok":true,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION"},"error":null}""");
+        foreach (var raw in new[] {
+            """{"protocol":3,"ok":true,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION"}}""",
+            """{"protocol":2,"ok":true,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION"},"error":null}""",
+            """{"protocol":3,"ok":false,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION"},"error":null}""",
+            """{"protocol":3,"ok":true,"result":{"kind":"unmanaged"},"error":null}""",
+            """{"protocol":3,"ok":true,"result":{"kind":"unmanaged","reason":"UPDATE_NATIVE_PACKAGE_MISMATCH"},"error":null}""",
+            """{"protocol":3,"ok":true,"result":{"kind":"held","reason":"UPDATE_TRANSACTION_COORDINATED_MAINTENANCE"},"error":null}""",
+            """{"protocol":3,"ok":true,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION","extra":true},"error":null}""",
+            """{"protocol":3,"protocol":3,"ok":true,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION"},"error":null}""",
+            """{"protocol":"3","ok":true,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION"},"error":null}""",
+            """{"protocol":3,"ok":true,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION"},"error":"unexpected"}""",
+            """{"protocol":3,"ok":true,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION"},"error":false}""",
+            """{"protocol":3,"ok":true,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION"},"error":null,"error":null}""",
+            """{"protocol":3,"ok":true,"result":{"kind":"unmanaged","reason":"MANUAL_INSTALLATION"},"error":null,"extra":true}""",
+        }) ExpectFailure<IOException>(() => Startup(raw), "SERVICE_INSTALL_REPLACEMENT_READINESS_UNVERIFIED");
+        Console.WriteLine("PASS forward replacement SCM observation and exact readiness contract");
         void Check(bool allowHold = true, bool requireLedger = true, bool forward = false) =>
             WindowsContainmentServiceInstaller.InspectStoreForReplacement(directory, allowHold, false, requireLedger, forward);
         Check(requireLedger: false);
@@ -1113,8 +1138,10 @@ internal static class NativeTests
             var runtime = new ServiceImportTransactionRuntime(ledger, importStore);
             var operation = System.Text.Json.JsonSerializer.SerializeToElement(new { workspaceRoot = workspace, destination = "repo", stagePath = stage, commit = new string('a', 40), privateHome = home });
             var explicitRecovery = false;
-            ServiceControlObservation Abort() => runtime.Control("abort_import", request.Identity, sid,
-                explicitRecovery ? JsonSerializer.SerializeToElement(new { workspaceRoot = workspace, destination = "repo", stagePath = stage, commit = new string('a', 40), privateHome = home, recoverLegacy = true }) : operation, caller.AccessToken);
+            ServiceControlObservation Abort() => explicitRecovery
+                ? runtime.ControlLegacyEngineFixture("abort_import", request.Identity, sid,
+                    JsonSerializer.SerializeToElement(new { workspaceRoot = workspace, destination = "repo", stagePath = stage, commit = new string('a', 40), privateHome = home, recoverLegacy = true }), caller.AccessToken)
+                : runtime.Control("abort_import", request.Identity, sid, operation, caller.AccessToken);
             if (scenario == "legacy_missing")
             {
                 ledger.AcquireImportReservation(request.Identity, sid);
@@ -2117,9 +2144,11 @@ internal static class NativeTests
         var ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(storePath));
         var install = Directory.CreateDirectory(Path.Combine(storeDirectory, "install")).FullName;
         var registered = false;
+        var maintenance = false;
         using var stopping = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         var server = WindowsContainmentService.RunPipeServerAsync(pipeName, ledger, stopping.Token, useCurrentUserTestLauncher: true,
-            startup: UpdateStartupGate.Isolated(install, storeDirectory, () => Volatile.Read(ref registered)));
+            startup: UpdateStartupGate.Isolated(install, storeDirectory, () => Volatile.Read(ref registered),
+                () => Volatile.Read(ref maintenance)));
         try
         {
             async Task CheckStartup(string kind, string reason)
@@ -2129,7 +2158,22 @@ internal static class NativeTests
                     || reply.RootElement.GetProperty("result").GetProperty("kind").GetString() != kind
                     || reply.RootElement.GetProperty("result").GetProperty("reason").GetString() != reason)
                     throw new Exception("Unexpected update startup disposition: " + reply.RootElement);
+                // Consume the actual framed service response, not a hand-made
+                // success envelope with a different null serialization policy.
+                if (kind == "unmanaged" && reason == "MANUAL_INSTALLATION")
+                    WindowsContainmentServiceInstaller.RequireReplacementStartupReceipt(reply.RootElement);
+                else
+                    ExpectFailure<IOException>(() => WindowsContainmentServiceInstaller.RequireReplacementStartupReceipt(reply.RootElement),
+                        "SERVICE_INSTALL_REPLACEMENT_READINESS_UNVERIFIED");
             }
+            await CheckStartup("unmanaged", "MANUAL_INSTALLATION");
+            Volatile.Write(ref maintenance, true);
+            await CheckStartup("held", "UPDATE_TRANSACTION_COORDINATED_MAINTENANCE");
+            using (var denied = await SendServiceRpcAsync(pipeName, """{"protocol":3,"command":"update_opaque"}"""u8.ToArray()))
+                if (denied.RootElement.GetProperty("ok").GetBoolean()
+                    || denied.RootElement.GetProperty("error").GetString() != "UPDATE_TRANSACTION_COORDINATED_MAINTENANCE")
+                    throw new Exception("Maintenance admission failed closed RPC");
+            Volatile.Write(ref maintenance, false);
             await CheckStartup("unmanaged", "MANUAL_INSTALLATION");
             Volatile.Write(ref registered, true);
             await CheckStartup("held", "UPDATE_ENROLLMENT_UNVERIFIED");

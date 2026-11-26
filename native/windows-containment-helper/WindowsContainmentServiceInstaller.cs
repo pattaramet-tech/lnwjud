@@ -170,6 +170,8 @@ internal static class WindowsContainmentServiceInstaller
     internal static void PreflightInstallation()
     {
         EnsureWindows();
+        if (UpdateStartupGate.InspectMachineMaintenance() is not null)
+            throw new IOException("SERVICE_INSTALL_COORDINATED_MAINTENANCE_HELD");
         using var manager = OpenSCManager(null, null, ScManagerConnect);
         if (manager.IsInvalid) throw new IOException("SERVICE_INSTALL_SCM_UNAVAILABLE");
         using var service = OpenService(manager, WindowsContainmentService.ServiceName, ServiceQueryConfigAccess | ServiceQueryStatusAccess);
@@ -363,10 +365,8 @@ internal static class WindowsContainmentServiceInstaller
             // and require its native startup result before enabling auto-start.
             using var reply = JsonDocument.Parse(WindowsContainmentServiceClient.SendAsync(expectedCandidateHash,
                 JsonSerializer.SerializeToUtf8Bytes(new { protocol = 3, command = "update_startup" })).GetAwaiter().GetResult());
-            var result = reply.RootElement;
-            if (result.GetProperty("protocol").GetInt32() != 3 || !result.GetProperty("ok").GetBoolean()
-                || result.GetProperty("result").GetProperty("kind").GetString() != "unmanaged"
-                || RequireReplacementState(service, image, ServiceDemandStart, running: true) != activatedPid)
+            RequireReplacementStartupReceipt(reply.RootElement);
+            if (RequireReplacementState(service, image, ServiceDemandStart, running: true) != activatedPid)
                 throw new IOException("SERVICE_INSTALL_REPLACEMENT_READINESS_UNVERIFIED");
             ConfigureReplacement(service, image, ServiceAutoStart);
             if (RequireReplacementState(service, image, ServiceAutoStart, running: true) != activatedPid)
@@ -378,6 +378,28 @@ internal static class WindowsContainmentServiceInstaller
             // Never roll back to the old image, stop a possibly admitted writer,
             // restore an older ledger, or delete a registration after failure.
         }
+    }
+
+    // Only the exact authenticated protocol-3 manual-installation receipt
+    // may transition a replacement to auto-start. Duplicate/extra properties,
+    // unknown reasons and incomplete responses are not compatibility evidence.
+    internal static void RequireReplacementStartupReceipt(JsonElement envelope)
+    {
+        static bool ExactKeys(JsonElement element, params string[] keys)
+            => element.ValueKind == JsonValueKind.Object
+                && element.EnumerateObject().Select(p => p.Name).Order(StringComparer.Ordinal)
+                    .SequenceEqual(keys.Order(StringComparer.Ordinal), StringComparer.Ordinal);
+        if (!ExactKeys(envelope, "protocol", "ok", "result", "error")
+            || envelope.GetProperty("error").ValueKind != JsonValueKind.Null
+            || envelope.GetProperty("protocol").ValueKind != JsonValueKind.Number
+            || !envelope.GetProperty("protocol").TryGetInt32(out var protocol) || protocol != 3
+            || envelope.GetProperty("ok").ValueKind != JsonValueKind.True
+            || !ExactKeys(envelope.GetProperty("result"), "kind", "reason")
+            || envelope.GetProperty("result").GetProperty("kind").ValueKind != JsonValueKind.String
+            || envelope.GetProperty("result").GetProperty("kind").GetString() != "unmanaged"
+            || envelope.GetProperty("result").GetProperty("reason").ValueKind != JsonValueKind.String
+            || envelope.GetProperty("result").GetProperty("reason").GetString() != "MANUAL_INSTALLATION")
+            throw new IOException("SERVICE_INSTALL_REPLACEMENT_READINESS_UNVERIFIED");
     }
 
     private static uint RequireReplacementState(SafeServiceHandle service, string image, uint startType, bool running)
@@ -397,6 +419,55 @@ internal static class WindowsContainmentServiceInstaller
             throw new IOException("SERVICE_INSTALL_REPLACEMENT_CONFIG_UNVERIFIED");
         return pid;
     }
+
+    // Bind inspection to the actual running helper, not a caller-selected
+    // image or hash. The protected manifest is a package consistency check,
+    // not independent release provenance.
+    internal static void InspectCurrentHelperStoppedService()
+    {
+        var image = Path.GetFullPath(Environment.ProcessPath
+            ?? throw new IOException("SERVICE_INSTALL_IMAGE_UNAVAILABLE"));
+        var programs = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
+        _ = ValidateImagePath(image, programs);
+        using var package = CoordinatedProtectedWitness.ForNativePackage(Path.GetDirectoryName(image)!);
+        var before = package.Digest();
+        VerifyPackageManifest(image);
+        InspectCoordinatedStoppedService(image, HashFile(image));
+        if (package.Digest() != before) throw new IOException("SERVICE_PACKAGE_HASH_MISMATCH");
+    }
+
+    // Read-only precondition for the future coordinated host adapter. This
+    // proves only the registered service is disabled/stopped and its image is
+    // the pinned package. It does not prove legacy desktop launch isolation.
+    internal static void InspectCoordinatedStoppedService(string expectedImage, string expectedSha256)
+    {
+        EnsureWindows();
+        ValidateSha256(expectedSha256);
+        var programs = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
+        using var manager = OpenSCManager(null, null, ScManagerConnect);
+        if (manager.IsInvalid) throw new IOException("SERVICE_INSTALL_SCM_UNAVAILABLE");
+        using var service = OpenService(manager, WindowsContainmentService.ServiceName, ServiceQueryConfigAccess | ServiceQueryStatusAccess);
+        if (service.IsInvalid) throw new IOException("SERVICE_INSTALL_EXISTING_SERVICE_UNVERIFIED");
+        _ = RequireReplacementState(service, expectedImage, ServiceDisabled, running: false);
+        ServiceEndpointIdentity.ValidateImage(expectedImage, programs, expectedSha256);
+        _ = RequireReplacementState(service, expectedImage, ServiceDisabled, running: false);
+    }
+
+#if NATIVE_CONTAINMENT_TESTS
+    // Synthetic observations are useful for regression only; they cannot
+    // become a production isolation attestation.
+    internal static void RequireCoordinatedLegacyIsolation(string expectedImage, string registeredImage, uint startType,
+        uint type, string account, uint state, uint pid, bool legacyLaunchIsolationVerified, bool allWritersQuiesced)
+    {
+        _ = ValidateReplacementState(expectedImage, ServiceDisabled, running: false, registeredImage, startType, type, account, state, pid);
+        // A stopped SCM service alone does not protect the old Desktop's
+        // local SQLite/opaque dispatch paths. An external OS-enforced launch
+        // boundary and all-writer quiescence are mandatory independent proofs.
+        if (!legacyLaunchIsolationVerified || !allWritersQuiesced)
+            throw new IOException("SERVICE_INSTALL_COORDINATED_LEGACY_ISOLATION_UNVERIFIED");
+    }
+
+#endif
 
     private static void ConfigureReplacement(SafeServiceHandle service, string image, uint startType)
     {

@@ -72,11 +72,12 @@ internal static class WindowsContainmentService
         private readonly object gate = new();
         private int active;
         private bool fenced;
-        internal IDisposable Enter()
+        internal IDisposable Enter(Action? verifyMaintenance = null)
         {
             lock (gate)
             {
                 if (fenced) throw new IOException("SERVICE_REMOVE_ADMISSION_FENCED");
+                verifyMaintenance?.Invoke();
                 active++;
                 return new Lease(this);
             }
@@ -217,13 +218,17 @@ internal static class WindowsContainmentService
                 if (request.Command is "update_enroll" or "update_prepare") timeout.CancelAfter(TimeSpan.FromSeconds(180));
 
                 using var caller = AuthenticatedPipeCaller.Capture(pipe);
+                // Startup inspection remains available to report the hold.
+                // No ordinary RPC or removal request can pass a known hold.
                 if (request.Command == "maintenance_remove")
                 {
+                    startup?.RequireMaintenanceOpen();
                     using var identity = new WindowsIdentity(caller.PrimaryToken.DangerousGetHandle());
                     if (!new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
                         throw new IOException("SERVICE_REMOVE_ADMIN_REQUIRED");
                     removalAdmission.Fence(() =>
                     {
+                        startup?.RequireMaintenanceOpen();
                         if (startup is null || startup.Inspect().Kind != "unmanaged"
                             || UpdateStartupGate.HasPrivateAuthority(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData)))
                             throw new IOException("SERVICE_REMOVE_MANAGED_AUTHORITY_REFUSED");
@@ -234,7 +239,10 @@ internal static class WindowsContainmentService
                     await WriteFrameAsync(pipe, new RpcResponse(3, true, new { kind = "removal_fenced", pid = Environment.ProcessId }, null), timeout.Token).ConfigureAwait(false);
                     return;
                 }
-                using var admission = removalAdmission.Enter();
+                using var admission = removalAdmission.Enter(() =>
+                {
+                    if (request.Command != "update_startup") startup?.RequireMaintenanceOpen();
+                });
                 if (request.Command == "update_launch")
                 {
                     if (startup is null) throw new IOException("SERVICE_UPDATE_AUTHORITY_UNAVAILABLE");
@@ -558,6 +566,10 @@ internal static class WindowsContainmentService
         }
     }
 
+    // The service is an own-process executable. Keep the cooperative lease
+    // until OS process exit, even on an exceptional shutdown with workers.
+    private static ProductionMaintenanceBoundary? productionLifetime;
+
     private static void ServiceMain(uint argc, nint argv)
     {
         _ = argc;
@@ -570,12 +582,16 @@ internal static class WindowsContainmentService
         SetStatus(ServiceStartPending, 0, 30000);
         try
         {
+            ProductionMaintenanceBoundary.RequireOpenStartup();
             using var authority = ServiceEndpointIdentity.ActivateProductionService();
+            if (productionLifetime is not null) throw new IOException("SERVICE_MAINTENANCE_LIFETIME_BUSY");
+            productionLifetime = ProductionMaintenanceBoundary.EnterServiceLifetime();
             var directory = EnsureStoreDirectory();
             var ledgerPath = Path.Combine(directory, "attempts.json");
             ServiceAttemptLedgerPersistence.EnsureNoReparsePoints(ledgerPath);
             if (!File.Exists(ledgerPath)) throw new IOException("SERVICE_STORE_LEDGER_MISSING");
             EnsureStoreAcl(new FileInfo(ledgerPath).GetAccessControl(AccessControlSections.Owner | AccessControlSections.Access));
+            productionLifetime.RequireOpen();
             var ledger = new ServiceAttemptLedger(new ServiceAttemptLedgerPersistence(ledgerPath), Path.Combine(directory, "imports"));
             SetStatus(ServiceRunning, AcceptStop, 0);
             RunProductionPipeServerAsync(authority, ledger, directory, stopping.Token).GetAwaiter().GetResult();
