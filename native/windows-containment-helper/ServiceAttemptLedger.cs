@@ -140,6 +140,54 @@ internal sealed class ServiceAttemptLedger
             if (entry.ReservationHeld && HasConflict(entry.Request, entry.Request.Identity.AttemptId))
                 throw new IOException("ATTEMPT_STORE_CORRUPT");
         }
+        // Reconstruct missing admission holds before accepting any new native
+        // work. Otherwise a lost main ledger could bypass an exclusive import
+        // hold or admit work while an earlier dispatch is still unresolved.
+        foreach (var stored in persistence.LoadManagedWriterWitnesses())
+        {
+            ValidateStored(stored);
+            var witness = ReadManagedWitness(stored.Request.Identity, stored.Request.AuthenticatedCallerSid)
+                ?? throw new IOException("SERVICE_WRITER_WITNESS_INVALID");
+            if (attempts.TryGetValue(witness.Request.Identity.AttemptId, out var existing))
+            {
+                if (existing.Request.Identity != witness.Request.Identity
+                    || existing.Request.AuthenticatedCallerSid != witness.Request.AuthenticatedCallerSid)
+                    throw new IOException("ATTEMPT_STORE_CORRUPT");
+                if (witness.Request.HoldForImport && !existing.Request.HoldForImport)
+                {
+                    existing.Request = existing.Request with { HoldForImport = true, Shared = false };
+                    existing.ReservationHeld = true;
+                    recovered = true;
+                }
+                if (witness.Phase == ServiceAttemptPhase.DispatchCommitted
+                    && existing.Phase is ServiceAttemptPhase.AdmissionRegistered or ServiceAttemptPhase.Prepared)
+                {
+                    existing.Request = witness.Request;
+                    existing.Phase = ServiceAttemptPhase.TerminationUnknown;
+                    existing.Reason = "SERVICE_RESTART_REQUIRES_RECONCILIATION";
+                    existing.ReservationHeld = true;
+                    recovered = true;
+                }
+                continue;
+            }
+            if (witness.Phase == ServiceAttemptPhase.DispatchCommitted)
+            {
+                witness.Phase = ServiceAttemptPhase.TerminationUnknown;
+                witness.Reason = "SERVICE_RESTART_REQUIRES_RECONCILIATION";
+            }
+            else if (IsVerifiedWitness(witness))
+            {
+                // An unexpected live or inaccessible job is not a terminal
+                // observation. Refuse service startup rather than drop a hold.
+                RequireAbsentJob(witness.Request.Identity);
+            }
+            if (witness.Request.HoldForImport) witness.ReservationHeld = true;
+            attempts.Add(witness.Request.Identity.AttemptId, witness);
+            recovered = true;
+        }
+        foreach (var entry in attempts.Values)
+            if (entry.ReservationHeld && HasConflict(entry.Request, entry.Request.Identity.AttemptId))
+                throw new IOException("ATTEMPT_STORE_CORRUPT");
         if (recovered) Persist();
     }
 
@@ -675,6 +723,14 @@ internal sealed class ServiceAttemptLedger
             {
                 entry.Request = entry.Request with { HoldForImport = false };
                 Persist();
+                if (IsManagedWriter(identity) && persistence is not null)
+                {
+                    var witness = ReadManagedWitness(identity, callerSid)
+                        ?? throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+                    witness.Request = witness.Request with { HoldForImport = false };
+                    if (witness.Phase == ServiceAttemptPhase.TerminalVerified) witness.ReservationHeld = false;
+                    WriteManagedWitness(witness);
+                }
 #if NATIVE_CONTAINMENT_TESTS
                 AfterImportHoldClearedForTest?.Invoke();
 #endif

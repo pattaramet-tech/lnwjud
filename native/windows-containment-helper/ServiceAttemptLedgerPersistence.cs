@@ -45,6 +45,23 @@ internal sealed class ServiceAttemptLedgerPersistence
             Path.GetDirectoryName(filename)!, "managed-writer-witness-" + key + ".json"));
     }
 
+    internal IEnumerable<PersistedServiceAttempt> LoadManagedWriterWitnesses()
+    {
+        var directory = Path.GetDirectoryName(filename)!;
+        EnsureNoReparsePoints(directory);
+        var count = 0;
+        foreach (var witnessFile in Directory.EnumerateFiles(directory, "managed-writer-witness-*.json"))
+        {
+            if (++count > MaximumAttempts) throw new IOException("ATTEMPT_HISTORY_LIMIT");
+            var records = new ServiceAttemptLedgerPersistence(witnessFile).Load();
+            if (records.Length != 1 || !String.Equals(
+                ManagedWriterWitness(records[0].Request.Identity.AttemptId).filename,
+                witnessFile, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("SERVICE_WRITER_WITNESS_INVALID");
+            yield return records[0];
+        }
+    }
+
     internal ServiceAttemptLedgerPersistence(string filename)
     {
         if (!Path.IsPathFullyQualified(filename)) throw new IOException("ATTEMPT_STORE_PATH_INVALID");
