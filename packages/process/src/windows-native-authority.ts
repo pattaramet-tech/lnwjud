@@ -84,7 +84,7 @@ export interface NativeProcessRequest {
 }
 export type WindowsContainmentRpcRequest = ({ readonly protocol: 3; readonly identity: NativeAttemptBinding } & (
   | { readonly command: 'prepare' | 'run'; readonly operation: NativeServiceProcessOperation; readonly reservationKey?: string; readonly operationDigest?: string }
-  | { readonly command: 'inspect' | 'cancel' }
+  | { readonly command: 'inspect' | 'cancel' | 'register_managed_writer' }
   | { readonly command: 'recover_after_reboot'; readonly recordedAt: string }
   | { readonly command: 'read_output'; readonly outputCursor?: NativeOutputCursor }
   | ({ readonly command: 'abort'; readonly reservationKey: string } & (
@@ -351,14 +351,23 @@ export class WindowsNativeAuthority {
     } catch (error) { releasePin(); throw error; }
   }
 
+  /** Persist the exact service-owned binding before a managed marker is written. */
+  public async registerManagedWriter(binding: NativeAttemptBinding): Promise<boolean> {
+    try {
+      validateBinding(binding);
+      const value = await this.client.request<unknown>({ protocol: 3, command: 'register_managed_writer', identity: binding });
+      if (!isRecord(value) || value.phase !== 6 || value.reservationHeld !== false) return false;
+      const identity = parseNativeAttemptBinding(value.identity);
+      return identity !== undefined && sameBinding(identity, binding);
+    } catch { return false; }
+  }
+
   public async inspect(input: AttemptLocation): Promise<NativeProcessObservation> {
     try {
       validateBinding(input.binding);
       return toObservation(await this.client.request<unknown>({ protocol: 3, command: 'inspect', identity: input.binding }), input.binding);
     } catch (error) {
-      return unknown(input.binding, error instanceof Error && (error.message === 'SERVICE_ENDPOINT_PACKAGE_MISMATCH'
-        || error.message === 'SERVICE_ENDPOINT_NOT_INSTALLED')
-        ? error.message : 'NATIVE_SERVICE_PROOF_UNAVAILABLE');
+      return unknown(input.binding, serviceFailureCode(error, 'NATIVE_SERVICE_PROOF_UNAVAILABLE'));
     }
   }
 
@@ -404,7 +413,7 @@ export class WindowsNativeAuthority {
           operation: input.operation,
         };
       return toObservation(await this.client.request<unknown>(request), input.binding);
-    } catch { return unknown(input.binding, 'NATIVE_PRELAUNCH_ABORT_UNVERIFIED'); }
+    } catch (error) { return unknown(input.binding, serviceFailureCode(error, 'NATIVE_PRELAUNCH_ABORT_UNVERIFIED')); }
   }
 
   public async control(input: AttemptLocation & { readonly command: NativeControlCommand; readonly request: unknown }): Promise<NativeControlObservation> {
@@ -798,6 +807,7 @@ function toObservation(value: unknown, binding: NativeAttemptBinding): NativePro
     return unknown(binding, 'NATIVE_TERMINAL_PROOF_INCOMPLETE');
   }
   if (value.phase === 5) return unknown(binding, safeReason(value.reason) ?? 'NATIVE_SERVICE_TERMINATION_UNKNOWN');
+  if (value.phase === 6) return unknown(binding, 'NATIVE_SERVICE_WRITER_REGISTERED');
   return unknown(binding, value.phase === 0 ? 'NATIVE_SERVICE_ATTEMPT_NOT_DISPATCHED' : 'NATIVE_SERVICE_DISPATCH_UNVERIFIED');
 }
 function sameBinding(candidate: NativeAttemptBinding, binding: NativeAttemptBinding): boolean { return BINDING_FIELDS.every((field) => candidate[field] === binding[field]); }

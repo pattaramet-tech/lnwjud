@@ -19,12 +19,25 @@ async function fixture(): Promise<{
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'managed-writer-proof-')));
   roots.push(root);
   const aborted = new Map<string, NativeAttemptBinding>();
+  const registered = new Map<string, NativeAttemptBinding>();
   const client: WindowsContainmentServiceClient = {
     async request<T>(request: WindowsContainmentRpcRequest): Promise<T> {
+      if (request.command === 'register_managed_writer') {
+        registered.set(request.identity.attemptId, request.identity);
+        return { identity: request.identity, phase: 6, reservationHeld: false } as T;
+      }
       const existing = aborted.get(request.identity.attemptId);
       if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(request.identity)) throw new Error('SERVICE_IDENTITY_MISMATCH');
-      if (request.command === 'abort') aborted.set(request.identity.attemptId, request.identity);
-      else if (request.command !== 'inspect' || existing === undefined) throw new Error('SERVICE_ATTEMPT_UNAVAILABLE');
+      if (request.command === 'abort') {
+        const intent = registered.get(request.identity.attemptId);
+        if (intent !== undefined && JSON.stringify(intent) !== JSON.stringify(request.identity)) throw new Error('SERVICE_OWNER_MISMATCH');
+        aborted.set(request.identity.attemptId, request.identity);
+      }
+      else if (request.command !== 'inspect' || existing === undefined) {
+        // Model a pre-registration record without allowing reconciliation to
+        // abort it implicitly in the legacy fixture's manual-abort cases.
+        throw new Error('SERVICE_ATTEMPT_UNAVAILABLE');
+      }
       const response: unknown = { identity: request.identity, phase: 2, reservationHeld: false };
       return response as T;
     },
@@ -32,7 +45,7 @@ async function fixture(): Promise<{
   };
   const authority = new WindowsNativeAuthority({ helper: { executable: path.join(root, 'helper.exe'), sha256: 'a'.repeat(64), buildId: 'lnwjud-containment-v2' }, pin: { modulePath: path.join(root, 'pin.node'), sha256: 'a'.repeat(64) }, profileDirectory: path.join(root, 'profile') }, client);
   const taskDirectory = path.join(root, 'tasks');
-  const admission = new SharedManagedWriterAdmission(taskDirectory, authority);
+  const admission = new SharedManagedWriterAdmission(taskDirectory, authority, 'linux');
   const taskId = randomUUID();
   const receiptPath = path.join(root, 'native', taskId, 'containment.receipt.json');
   const input = { actorClientId: 'client', actorSessionId: 'session', workspaceId: 'workspace', kind: 'contained_process' as const, nativeTaskId: taskId, nativeReceiptPath: receiptPath };
@@ -122,6 +135,24 @@ describe('SharedManagedWriterAdmission authenticated release', () => {
     expect(await new SharedManagedWriterAdmission(f.taskDirectory).enter(f.input)).toMatchObject({ ok: false, error: {
       code: 'INVALID_INPUT', message: 'Contained writer trusted native authority is unavailable',
     } });
+  });
+
+  it('requires an exact persisted Windows registration before publishing a marker', async () => {
+    const f = await fixture();
+    const client: WindowsContainmentServiceClient = {
+      async request<T>(request: WindowsContainmentRpcRequest): Promise<T> {
+        if (request.command === 'register_managed_writer') throw new Error('ATTEMPT_STORE_UNAVAILABLE');
+        throw new Error('unexpected RPC');
+      },
+      async startWatcher() {},
+    };
+    const failing = new WindowsNativeAuthority(f.authority.config, client);
+    const admission = new SharedManagedWriterAdmission(f.taskDirectory, failing, 'win32');
+    await expect(admission.enter(f.input)).resolves.toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    const diagnostics = await new DurableShellTaskIndex(f.taskDirectory, {
+      maxConcurrentTasks: 16, inspectTask: async (): Promise<'missing'> => 'missing',
+    }).diagnostics();
+    expect(diagnostics.managed_writer_reservations).toBe(0);
   });
 
   it('denies new macOS process writers before reservation but still permits bounded synchronous mutations', async () => {

@@ -10,6 +10,8 @@ internal enum ServiceAttemptPhase
     Running,
     TerminalVerified,
     TerminationUnknown,
+    // Append only: phase numbers are part of protocol 3 and persisted snapshots.
+    AdmissionRegistered,
 }
 
 internal enum ServiceProcessOutcome
@@ -138,6 +140,31 @@ internal sealed class ServiceAttemptLedger
         if (recovered) Persist();
     }
 
+    // A service-owned, durable binding must exist before the host publishes a
+    // managed-writer marker. This phase does not admit or dispatch a process.
+    internal ServiceAttemptObservation RegisterManagedWriter(ServiceAttemptIdentity identity, string callerSid)
+    {
+        if (!IsManagedWriter(identity)) throw new IOException("SERVICE_WRITER_IDENTITY_INVALID");
+        var request = new ServiceAttemptRequest(identity, callerSid, GlobalReservationKey, identity.RequestDigest, Shared: true);
+        Validate(request);
+        lock (gate)
+        {
+            EnsureAvailable();
+            if (attempts.TryGetValue(identity.AttemptId, out var existing))
+            {
+                if (!SameRequest(existing.Request, request)) throw new IOException("ATTEMPT_ID_CONFLICT");
+                return Observe(existing);
+            }
+            var entry = new Entry(request) { Phase = ServiceAttemptPhase.AdmissionRegistered, ReservationHeld = false };
+            attempts.Add(identity.AttemptId, entry);
+            Persist();
+            return Observe(entry);
+        }
+    }
+
+    private static bool IsManagedWriter(ServiceAttemptIdentity identity) =>
+        identity.ReservationId.StartsWith("managed-writer-", StringComparison.Ordinal);
+
     internal ServiceAttemptObservation Prepare(ServiceAttemptRequest request)
     {
         Validate(request);
@@ -146,6 +173,20 @@ internal sealed class ServiceAttemptLedger
             EnsureAvailable();
             if (attempts.TryGetValue(request.Identity.AttemptId, out var existing))
             {
+                if (existing.Phase == ServiceAttemptPhase.AdmissionRegistered)
+                {
+                    if (existing.Request.Identity != request.Identity
+                        || !String.Equals(existing.Request.AuthenticatedCallerSid, request.AuthenticatedCallerSid, StringComparison.Ordinal)
+                        || !String.Equals(existing.Request.ReservationKey, request.ReservationKey, StringComparison.OrdinalIgnoreCase)
+                        || !request.Shared || request.HoldForImport || request.RegistryOnly)
+                        throw new IOException("ATTEMPT_ID_CONFLICT");
+                    if (HasConflict(request, request.Identity.AttemptId)) throw new IOException("WRITER_RESERVATION_BUSY");
+                    existing.Request = request;
+                    existing.Phase = ServiceAttemptPhase.Prepared;
+                    existing.ReservationHeld = true;
+                    Persist();
+                    return Observe(existing);
+                }
                 if (!SameRequest(existing.Request, request)) throw new IOException("ATTEMPT_ID_CONFLICT");
                 return Observe(existing);
             }
@@ -202,6 +243,9 @@ internal sealed class ServiceAttemptLedger
                 }
                 throw new IOException("SERVICE_RECOVERY_EXISTING_ATTEMPT_UNVERIFIED");
             }
+            // An unauthenticated host timestamp cannot bind a missing managed
+            // attempt to a prior boot. No native record means no owner proof.
+            if (IsManagedWriter(identity)) throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
             var recovered = new Entry(request)
             {
                 Phase = ServiceAttemptPhase.TerminalVerified,
@@ -262,10 +306,21 @@ internal sealed class ServiceAttemptLedger
                     || !String.Equals(existing.Request.AuthenticatedCallerSid, request.AuthenticatedCallerSid, StringComparison.Ordinal)
                     || !String.Equals(existing.Request.ReservationKey, request.ReservationKey, StringComparison.OrdinalIgnoreCase))
                     throw new IOException("ATTEMPT_ID_CONFLICT");
-                if (!String.Equals(existing.Request.OperationDigest, request.OperationDigest, StringComparison.Ordinal)
+                if (existing.Phase != ServiceAttemptPhase.AdmissionRegistered
+                    && !String.Equals(existing.Request.OperationDigest, request.OperationDigest, StringComparison.Ordinal)
                     && !String.Equals(identity.RequestDigest, request.OperationDigest, StringComparison.Ordinal))
                     throw new IOException("SERVICE_OPERATION_DIGEST_MISMATCH");
-                if (existing.Phase == ServiceAttemptPhase.Prepared)
+                if (existing.Phase == ServiceAttemptPhase.AdmissionRegistered)
+                {
+                    // Positive durable no-dispatch evidence, plus an exact Job
+                    // check. The gate prevents Prepare/dispatch racing this abort.
+                    var job = ContainedProcess.QueryJob(ContainedProcess.GetJobName(identity.AttemptId));
+                    if (job.Status != ContainedProcess.JobProbeStatus.NotFound)
+                        throw new IOException("SERVICE_RECOVERY_JOB_UNVERIFIED");
+                    existing.Phase = ServiceAttemptPhase.LaunchNotStarted;
+                    Persist();
+                }
+                else if (existing.Phase == ServiceAttemptPhase.Prepared)
                 {
                     existing.Phase = ServiceAttemptPhase.LaunchNotStarted;
                     Persist();
@@ -274,6 +329,8 @@ internal sealed class ServiceAttemptLedger
             }
 
             if (HasConflict(request)) throw new IOException("WRITER_RESERVATION_BUSY");
+            // Never mint a managed-writer no-launch proof from a missing record.
+            if (IsManagedWriter(identity)) throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
             var tombstone = new Entry(request) { Phase = ServiceAttemptPhase.LaunchNotStarted };
             attempts.Add(identity.AttemptId, tombstone);
             Persist();
@@ -454,7 +511,13 @@ internal sealed class ServiceAttemptLedger
 
     internal ServiceAttemptObservation Inspect(ServiceAttemptIdentity identity, string callerSid)
     {
-        lock (gate) return Observe(Require(identity, callerSid));
+        lock (gate)
+        {
+            EnsureAvailable();
+            if (IsManagedWriter(identity) && !attempts.ContainsKey(identity.AttemptId))
+                throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+            return Observe(Require(identity, callerSid));
+        }
     }
 
     internal static bool IsMcp(ServiceAttemptIdentity identity) => identity.TaskId.StartsWith("mcp:", StringComparison.Ordinal);
@@ -646,7 +709,11 @@ internal sealed class ServiceAttemptLedger
                 : stored.Outcome is not null || stored.ExitCode is not null || stored.ActiveProcesses is not null)
             || (stored.Phase is ServiceAttemptPhase.Prepared or ServiceAttemptPhase.DispatchCommitted or ServiceAttemptPhase.LaunchNotStarted
                 && stored.TargetPid is not null)
-            || (!stored.ReservationHeld && stored.Phase is not (ServiceAttemptPhase.LaunchNotStarted or ServiceAttemptPhase.TerminalVerified)
+            || (stored.Phase == ServiceAttemptPhase.AdmissionRegistered
+                && (stored.ReservationHeld || !IsManagedWriter(stored.Request.Identity) || !stored.Request.Shared
+                    || stored.Request.HoldForImport || stored.Request.RegistryOnly || stored.TargetPid is not null
+                    || stored.Request.OperationDigest != stored.Request.Identity.RequestDigest))
+            || (!stored.ReservationHeld && stored.Phase is not (ServiceAttemptPhase.LaunchNotStarted or ServiceAttemptPhase.TerminalVerified or ServiceAttemptPhase.AdmissionRegistered)
                 && !stored.Request.RegistryOnly))
             throw new IOException("ATTEMPT_STORE_CORRUPT");
     }

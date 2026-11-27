@@ -235,6 +235,8 @@ internal static class WindowsContainmentService
                     "mcp_close_child" => new ServiceMcpChildObservation(await runtime.CloseMcpChildAsync(request.Connection ?? throw new IOException("SERVICE_MCP_CONNECTION_REQUIRED"),
                         request.Identity ?? throw new IOException("SERVICE_IDENTITY_REQUIRED"), caller.Sid).ConfigureAwait(false)),
                     "mcp_close_connection" => await runtime.CloseMcpConnectionAsync(request.Connection ?? throw new IOException("SERVICE_MCP_CONNECTION_REQUIRED"), caller.Sid).ConfigureAwait(false),
+                    "register_managed_writer" => ledger.RegisterManagedWriter(
+                        request.Identity ?? throw new IOException("SERVICE_IDENTITY_REQUIRED"), caller.Sid),
                     "prepare" => Prepare(ledger, request, caller.Sid),
                     "run" => Run(ledger, runtime, request, caller),
                     "inspect" => Inspect(runtime, request, caller.Sid),

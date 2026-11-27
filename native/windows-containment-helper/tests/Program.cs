@@ -336,6 +336,7 @@ internal static class NativeTests
             TestAbsentServiceRpc();
             Console.WriteLine("PASS absent Windows service is detected without waiting for the native RPC deadline");
             TestServiceAttemptLedger();
+            TestManagedWriterRegistration();
             Console.WriteLine("PASS service attempt ownership, reservation, and terminal release lifecycle");
             TestLaunchTokenFailureBeforeDispatch();
             Console.WriteLine("PASS token setup failure releases only a proved never-started native attempt");
@@ -783,6 +784,47 @@ internal static class NativeTests
         var afterEarlyRelease = ledger.Prepare(earlyAbortRequest);
         if (afterEarlyRelease.Phase != ServiceAttemptPhase.LaunchNotStarted || afterEarlyRelease.ReservationHeld)
             throw new Exception("Released tombstone allowed prepare replay or reacquired its reservation");
+    }
+
+    private static void TestManagedWriterRegistration()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "lnwjud-writer-registration-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var persistence = new ServiceAttemptLedgerPersistence(Path.Combine(directory, "ledger.json"));
+            var request = NewServiceAttemptRequest(Guid.NewGuid().ToString("D"), ServiceAttemptLedger.GlobalReservationKey) with { Shared = true };
+            request = request with { Identity = request.Identity with { ReservationId = "managed-writer-" + Guid.NewGuid().ToString("D") } };
+            var ledger = new ServiceAttemptLedger(persistence);
+            var registration = ledger.RegisterManagedWriter(request.Identity, request.AuthenticatedCallerSid);
+            if (registration.Phase != ServiceAttemptPhase.AdmissionRegistered || registration.ReservationHeld)
+                throw new Exception("Registration must not hold native capacity or dispatch");
+            ledger = new ServiceAttemptLedger(persistence);
+            if (ledger.Inspect(request.Identity, request.AuthenticatedCallerSid) != registration)
+                throw new Exception("Registration was not durable before marker publication");
+            ExpectFailure<UnauthorizedAccessException>(() => ledger.Inspect(request.Identity, "S-1-5-21-9999"), "ATTEMPT_OWNER_MISMATCH");
+            var abort = ledger.AbortBeforeLaunch(request with { OperationDigest = request.Identity.RequestDigest });
+            if (abort.Phase != ServiceAttemptPhase.LaunchNotStarted || abort.ReservationHeld)
+                throw new Exception("Registered intent was not durably fenced");
+            ledger = new ServiceAttemptLedger(persistence);
+            if (ledger.Inspect(request.Identity, request.AuthenticatedCallerSid) != abort)
+                throw new Exception("Abort tombstone was not durable");
+            ExpectFailure<IOException>(() => ledger.Prepare(request), "ATTEMPT_ID_CONFLICT");
+            var missing = request with { Identity = request.Identity with { AttemptId = Guid.NewGuid().ToString("D") } };
+            ExpectFailure<IOException>(() => ledger.AbortBeforeLaunch(missing), "SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+            var runnable = request with { Identity = request.Identity with {
+                AttemptId = Guid.NewGuid().ToString("D"), ReservationId = "managed-writer-" + Guid.NewGuid().ToString("D")
+            } };
+            _ = ledger.RegisterManagedWriter(runnable.Identity, runnable.AuthenticatedCallerSid);
+            var prepared = ledger.Prepare(runnable);
+            if (prepared.Phase != ServiceAttemptPhase.Prepared || !prepared.ReservationHeld
+                || !ledger.TryCommitDispatch(runnable.Identity, runnable.AuthenticatedCallerSid, runnable.OperationDigest))
+                throw new Exception("Exact registered binding did not promote to dispatch");
+            var dispatched = ledger.AbortBeforeLaunch(runnable);
+            if (dispatched.Phase != ServiceAttemptPhase.DispatchCommitted || !dispatched.ReservationHeld)
+                throw new Exception("Committed dispatch was released by abort");
+        }
+        finally { Directory.Delete(directory, true); }
     }
 
     private static void TestLaunchTokenFailureBeforeDispatch()

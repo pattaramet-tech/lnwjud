@@ -115,6 +115,10 @@ export class SharedManagedWriterAdmission {
     if (this.platform === 'darwin' && nativeBinding !== undefined && !await this.macosNativeAuthority?.register(nativeBinding)) {
       return err(appError('CONFLICT', 'macOS native process owner could not register this attempt; no reservation was created'));
     }
+    if (this.platform === 'win32' && nativeBinding !== undefined
+      && !await this.nativeAuthority?.registerManagedWriter(nativeBinding)) {
+      return err(appError('CONFLICT', 'Windows native writer binding could not be persisted; no reservation was created'));
+    }
     const reserved = await this.index.reserve({
       taskId: id,
       capacityClass: 'managed_writer',
@@ -128,7 +132,12 @@ export class SharedManagedWriterAdmission {
       ownerWorkspaceId: input.workspaceId,
     });
     if (!reserved.ok) {
-      if (this.platform === 'darwin' && nativeBinding !== undefined) await this.macosNativeAuthority?.abortBeforeLaunch({ binding: nativeBinding });
+      if (nativeBinding !== undefined) {
+        const authority = this.platform === 'darwin' ? this.macosNativeAuthority : this.nativeAuthority;
+        // A registered intent is never a live writer; the authenticated abort
+        // fences it even if a failed marker write left an ambiguous result.
+        await authority?.abortBeforeLaunch({ binding: nativeBinding });
+      }
       return reserved;
     }
     const release = async (): Promise<void> => {
@@ -165,11 +174,14 @@ export class SharedManagedWriterAdmission {
     let proof = await authority.inspect({ directory: path.dirname(reservation.nativeReceiptPath), binding });
     // The service atomically checks dispatch state and writes an exact-attempt
     // tombstone. A dispatched or unverifiable attempt cannot take this path.
-    if (proof.state === 'termination_unknown' && proof.reason === 'NATIVE_SERVICE_ATTEMPT_NOT_DISPATCHED') {
+    if (proof.state === 'termination_unknown' && (proof.reason === 'NATIVE_SERVICE_ATTEMPT_NOT_DISPATCHED'
+      || proof.reason === 'NATIVE_SERVICE_WRITER_REGISTERED')) {
       proof = await authority.abortBeforeLaunch({ directory: path.dirname(reservation.nativeReceiptPath), binding });
     }
     if (proof.state === 'termination_unknown' && reservation.reservedAt !== undefined
-      && proof.reason !== 'SERVICE_ENDPOINT_PACKAGE_MISMATCH' && proof.reason !== 'SERVICE_ENDPOINT_NOT_INSTALLED') {
+      && proof.reason !== 'SERVICE_ENDPOINT_PACKAGE_MISMATCH' && proof.reason !== 'SERVICE_ENDPOINT_NOT_INSTALLED'
+      && proof.reason !== 'SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED' && proof.reason !== 'SERVICE_OWNER_MISMATCH'
+      && proof.reason !== 'SERVICE_RECOVERY_JOB_UNVERIFIED' && proof.reason !== 'NATIVE_SERVICE_IDENTITY_MISMATCH') {
       proof = await authority.recoverAfterReboot({
         directory: path.dirname(reservation.nativeReceiptPath), binding, recordedAt: reservation.reservedAt,
       });

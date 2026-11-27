@@ -15,6 +15,25 @@ function fixture(response: unknown): { authority: WindowsNativeAuthority; reques
   return { authority: new WindowsNativeAuthority(configuration, client), request };
 }
 
+describe('Windows managed writer binding registration', () => {
+  it('requires exact authenticated identity and the non-dispatch registration phase', async () => {
+    const valid = fixture({ identity: binding, phase: 6, reservationHeld: false });
+    expect(await valid.authority.registerManagedWriter(binding)).toBe(true);
+    expect(valid.request).toHaveBeenCalledWith({ protocol: 3, command: 'register_managed_writer', identity: binding });
+    expect(await valid.authority.inspect({ binding })).toMatchObject({ state: 'termination_unknown', reason: 'NATIVE_SERVICE_WRITER_REGISTERED' });
+    const wrong = fixture({ identity: { ...binding, ownerSessionId: 'other' }, phase: 6, reservationHeld: false });
+    expect(await wrong.authority.registerManagedWriter(binding)).toBe(false);
+    expect(await fixture({ identity: binding, phase: 0, reservationHeld: true }).authority.registerManagedWriter(binding)).toBe(false);
+  });
+
+  it('preserves a symbolic native refusal without inventing terminal proof', async () => {
+    const f = fixture(undefined);
+    f.request.mockRejectedValue(new Error('SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED'));
+    expect(await f.authority.inspect({ binding })).toEqual({ state: 'termination_unknown', binding, reason: 'SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED' });
+    expect(await f.authority.abortBeforeLaunch({ binding })).toMatchObject({ state: 'termination_unknown', reason: 'SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED' });
+  });
+});
+
 describe('Windows service interrupted restart contract', () => {
   it('releases proven-zero process admission without fabricating a successful target exit', async () => {
     const response = { identity: binding, phase: 4, outcome: 3, exitCode: 125, activeProcesses: 0, reservationHeld: false };
