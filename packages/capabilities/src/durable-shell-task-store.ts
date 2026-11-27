@@ -946,7 +946,6 @@ export class DurableShellTaskStore {
     if (authority === undefined || binding === undefined || !nativeBindingMatchesMetadata(metadata, binding)) return unknown();
     let proof = await authority.inspect({ directory: this.taskDirectory(metadata.task_id), binding });
     let rebootRecovered = false;
-    if (proof.state === 'running') return isTerminal(metadata.state) ? unknown() : { ...metadata, state: metadata.state === 'starting' ? 'running' : metadata.state };
     if (proof.state === 'termination_unknown') {
       const deadlinePassed = typeof metadata.deadline_at === 'string' && Date.now() > new Date(metadata.deadline_at).getTime();
       const isUnverifiedState = metadata.state === 'termination_unverified';
@@ -971,6 +970,7 @@ export class DurableShellTaskStore {
         }
       }
     }
+    if (proof.state === 'running') return isTerminal(metadata.state) ? unknown() : { ...metadata, state: metadata.state === 'starting' ? 'running' : metadata.state };
     if (proof.state === 'termination_unknown') return isTerminal(metadata.state) ? unknown() : metadata;
     const expectedState = proof.state === 'launch_not_started' ? 'failed' : nativeOutcomeState(proof.outcome, proof.exitCode);
     const expectedExitCode = proof.state === 'launch_not_started' ? -1 : proof.exitCode;
