@@ -19,18 +19,16 @@ async function fixture(): Promise<{
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'managed-writer-proof-')));
   roots.push(root);
   const aborted = new Map<string, NativeAttemptBinding>();
-  const registered = new Map<string, NativeAttemptBinding>();
   const client: WindowsContainmentServiceClient = {
     async request<T>(request: WindowsContainmentRpcRequest): Promise<T> {
       if (request.command === 'register_managed_writer') {
-        registered.set(request.identity.attemptId, request.identity);
-        return { identity: request.identity, phase: 6, reservationHeld: false } as T;
+        const identity = { ...request.identity, reservationId: 'managed-writer-' + randomUUID(),
+          attemptId: randomUUID(), requestDigest: 'b'.repeat(64) };
+        return { identity, phase: 6, reservationHeld: false } as T;
       }
       const existing = aborted.get(request.identity.attemptId);
       if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(request.identity)) throw new Error('SERVICE_IDENTITY_MISMATCH');
       if (request.command === 'abort') {
-        const intent = registered.get(request.identity.attemptId);
-        if (intent !== undefined && JSON.stringify(intent) !== JSON.stringify(request.identity)) throw new Error('SERVICE_OWNER_MISMATCH');
         aborted.set(request.identity.attemptId, request.identity);
       }
       else if (request.command !== 'inspect' || existing === undefined) {
@@ -45,7 +43,7 @@ async function fixture(): Promise<{
   };
   const authority = new WindowsNativeAuthority({ helper: { executable: path.join(root, 'helper.exe'), sha256: 'a'.repeat(64), buildId: 'lnwjud-containment-v2' }, pin: { modulePath: path.join(root, 'pin.node'), sha256: 'a'.repeat(64) }, profileDirectory: path.join(root, 'profile') }, client);
   const taskDirectory = path.join(root, 'tasks');
-  const admission = new SharedManagedWriterAdmission(taskDirectory, authority, 'linux');
+  const admission = new SharedManagedWriterAdmission(taskDirectory, authority);
   const taskId = randomUUID();
   const receiptPath = path.join(root, 'native', taskId, 'containment.receipt.json');
   const input = { actorClientId: 'client', actorSessionId: 'session', workspaceId: 'workspace', kind: 'contained_process' as const, nativeTaskId: taskId, nativeReceiptPath: receiptPath };

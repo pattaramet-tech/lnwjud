@@ -145,16 +145,21 @@ internal sealed class ServiceAttemptLedger
     internal ServiceAttemptObservation RegisterManagedWriter(ServiceAttemptIdentity identity, string callerSid)
     {
         if (!IsManagedWriter(identity)) throw new IOException("SERVICE_WRITER_IDENTITY_INVALID");
-        var request = new ServiceAttemptRequest(identity, callerSid, GlobalReservationKey, identity.RequestDigest, Shared: true);
-        Validate(request);
+        Validate(new ServiceAttemptRequest(identity, callerSid, GlobalReservationKey, identity.RequestDigest, Shared: true));
+        // The caller may propose owner/task identity but cannot recreate a lost
+        // attempt or reservation by choosing its old ID or request digest.
+        var reservationId = "managed-writer-" + Guid.NewGuid().ToString("D");
+        var attemptId = Guid.NewGuid().ToString("D");
+        var digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new[] {
+                reservationId, attemptId, identity.TaskId, identity.OwnerClientId, identity.OwnerSessionId, identity.WorkspaceId
+            }))).ToLowerInvariant();
+        identity = identity with { ReservationId = reservationId, AttemptId = attemptId, RequestDigest = digest, Generation = 1 };
+        var request = new ServiceAttemptRequest(identity, callerSid, GlobalReservationKey, digest, Shared: true);
         lock (gate)
         {
             EnsureAvailable();
-            if (attempts.TryGetValue(identity.AttemptId, out var existing))
-            {
-                if (!SameRequest(existing.Request, request)) throw new IOException("ATTEMPT_ID_CONFLICT");
-                return Observe(existing);
-            }
+            if (attempts.ContainsKey(identity.AttemptId)) throw new IOException("ATTEMPT_ID_CONFLICT");
             var entry = new Entry(request) { Phase = ServiceAttemptPhase.AdmissionRegistered, ReservationHeld = false };
             attempts.Add(identity.AttemptId, entry);
             Persist();
@@ -190,6 +195,7 @@ internal sealed class ServiceAttemptLedger
                 if (!SameRequest(existing.Request, request)) throw new IOException("ATTEMPT_ID_CONFLICT");
                 return Observe(existing);
             }
+            if (IsManagedWriter(request.Identity)) throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
             if (HasConflict(request)) throw new IOException("WRITER_RESERVATION_BUSY");
             var entry = new Entry(request) { ReservationHeld = !request.RegistryOnly };
             attempts.Add(request.Identity.AttemptId, entry);

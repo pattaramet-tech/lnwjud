@@ -17,13 +17,15 @@ function fixture(response: unknown): { authority: WindowsNativeAuthority; reques
 
 describe('Windows managed writer binding registration', () => {
   it('requires exact authenticated identity and the non-dispatch registration phase', async () => {
-    const valid = fixture({ identity: binding, phase: 6, reservationHeld: false });
-    expect(await valid.authority.registerManagedWriter(binding)).toBe(true);
+    const registered = { ...binding, reservationId: 'managed-writer-12345678-1234-1234-1234-123456789abc',
+      attemptId: '87654321-1234-1234-1234-123456789abc', requestDigest: 'b'.repeat(64) };
+    const valid = fixture({ identity: registered, phase: 6, reservationHeld: false });
+    expect(await valid.authority.registerManagedWriter(binding)).toEqual(registered);
     expect(valid.request).toHaveBeenCalledWith({ protocol: 3, command: 'register_managed_writer', identity: binding });
-    expect(await valid.authority.inspect({ binding })).toMatchObject({ state: 'termination_unknown', reason: 'NATIVE_SERVICE_WRITER_REGISTERED' });
-    const wrong = fixture({ identity: { ...binding, ownerSessionId: 'other' }, phase: 6, reservationHeld: false });
-    expect(await wrong.authority.registerManagedWriter(binding)).toBe(false);
-    expect(await fixture({ identity: binding, phase: 0, reservationHeld: true }).authority.registerManagedWriter(binding)).toBe(false);
+    expect(await valid.authority.inspect({ binding: registered })).toMatchObject({ state: 'termination_unknown', reason: 'NATIVE_SERVICE_WRITER_REGISTERED' });
+    const wrong = fixture({ identity: { ...registered, ownerSessionId: 'other' }, phase: 6, reservationHeld: false });
+    expect(await wrong.authority.registerManagedWriter(binding)).toBeUndefined();
+    expect(await fixture({ identity: binding, phase: 6, reservationHeld: false }).authority.registerManagedWriter(binding)).toBeUndefined();
   });
 
   it('preserves a symbolic native refusal without inventing terminal proof', async () => {

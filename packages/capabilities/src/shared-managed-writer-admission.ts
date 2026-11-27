@@ -92,9 +92,9 @@ export class SharedManagedWriterAdmission {
       && (input.kind !== 'contained_process' || !await this.macosNativeAuthority?.available())) {
       return err(appError('CONFLICT', 'macOS process writer requires an enrolled Endpoint Security owner; no reservation was created'));
     }
-    const id = 'managed-writer-' + randomUUID();
-    const digest = createHash('sha256').update(JSON.stringify([id, input.actorClientId, input.actorSessionId, input.workspaceId])).digest('hex');
-    const nativeBinding = input.kind === 'contained_process' ? parseNativeAttemptBinding({
+    let id = 'managed-writer-' + randomUUID();
+    let digest = createHash('sha256').update(JSON.stringify([id, input.actorClientId, input.actorSessionId, input.workspaceId])).digest('hex');
+    let nativeBinding = input.kind === 'contained_process' ? parseNativeAttemptBinding({
       taskId: input.nativeTaskId, reservationId: id, attemptId: randomUUID(), generation: 1,
       requestDigest: digest, ownerClientId: input.actorClientId, ownerSessionId: input.actorSessionId,
       workspaceId: input.workspaceId,
@@ -115,9 +115,14 @@ export class SharedManagedWriterAdmission {
     if (this.platform === 'darwin' && nativeBinding !== undefined && !await this.macosNativeAuthority?.register(nativeBinding)) {
       return err(appError('CONFLICT', 'macOS native process owner could not register this attempt; no reservation was created'));
     }
-    if (this.platform === 'win32' && nativeBinding !== undefined
-      && !await this.nativeAuthority?.registerManagedWriter(nativeBinding)) {
-      return err(appError('CONFLICT', 'Windows native writer binding could not be persisted; no reservation was created'));
+    if (this.platform === 'win32' && nativeBinding !== undefined) {
+      const registered = await this.nativeAuthority?.registerManagedWriter(nativeBinding);
+      if (registered === undefined) {
+        return err(appError('CONFLICT', 'Windows native writer binding could not be persisted; no reservation was created'));
+      }
+      nativeBinding = registered;
+      id = registered.reservationId;
+      digest = registered.requestDigest;
     }
     const reserved = await this.index.reserve({
       taskId: id,

@@ -352,14 +352,20 @@ export class WindowsNativeAuthority {
   }
 
   /** Persist the exact service-owned binding before a managed marker is written. */
-  public async registerManagedWriter(binding: NativeAttemptBinding): Promise<boolean> {
+  public async registerManagedWriter(binding: NativeAttemptBinding): Promise<NativeAttemptBinding | undefined> {
     try {
       validateBinding(binding);
       const value = await this.client.request<unknown>({ protocol: 3, command: 'register_managed_writer', identity: binding });
-      if (!isRecord(value) || value.phase !== 6 || value.reservationHeld !== false) return false;
+      if (!isRecord(value) || value.phase !== 6 || value.reservationHeld !== false) return undefined;
       const identity = parseNativeAttemptBinding(value.identity);
-      return identity !== undefined && sameBinding(identity, binding);
-    } catch { return false; }
+      if (identity === undefined || identity.generation !== 1 || identity.taskId !== binding.taskId
+        || identity.ownerClientId !== binding.ownerClientId || identity.ownerSessionId !== binding.ownerSessionId
+        || identity.workspaceId !== binding.workspaceId || identity.reservationId === binding.reservationId
+        || identity.attemptId === binding.attemptId || identity.requestDigest === binding.requestDigest
+        || !/^managed-writer-[0-9a-f-]{36}$/.test(identity.reservationId)
+        || !/^[0-9a-f-]{36}$/.test(identity.attemptId)) return undefined;
+      return identity;
+    } catch { return undefined; }
   }
 
   public async inspect(input: AttemptLocation): Promise<NativeProcessObservation> {

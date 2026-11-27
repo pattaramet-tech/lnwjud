@@ -796,7 +796,11 @@ internal static class NativeTests
             var request = NewServiceAttemptRequest(Guid.NewGuid().ToString("D"), ServiceAttemptLedger.GlobalReservationKey) with { Shared = true };
             request = request with { Identity = request.Identity with { ReservationId = "managed-writer-" + Guid.NewGuid().ToString("D") } };
             var ledger = new ServiceAttemptLedger(persistence);
-            var registration = ledger.RegisterManagedWriter(request.Identity, request.AuthenticatedCallerSid);
+            var proposed = request.Identity;
+            var registration = ledger.RegisterManagedWriter(proposed, request.AuthenticatedCallerSid);
+            if (registration.Identity.AttemptId == proposed.AttemptId || registration.Identity.ReservationId == proposed.ReservationId)
+                throw new Exception("Native service reused caller-chosen identity");
+            request = request with { Identity = registration.Identity };
             if (registration.Phase != ServiceAttemptPhase.AdmissionRegistered || registration.ReservationHeld)
                 throw new Exception("Registration must not hold native capacity or dispatch");
             ledger = new ServiceAttemptLedger(persistence);
@@ -812,10 +816,12 @@ internal static class NativeTests
             ExpectFailure<IOException>(() => ledger.Prepare(request), "ATTEMPT_ID_CONFLICT");
             var missing = request with { Identity = request.Identity with { AttemptId = Guid.NewGuid().ToString("D") } };
             ExpectFailure<IOException>(() => ledger.AbortBeforeLaunch(missing), "SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+            ExpectFailure<IOException>(() => ledger.Prepare(missing), "SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
             var runnable = request with { Identity = request.Identity with {
                 AttemptId = Guid.NewGuid().ToString("D"), ReservationId = "managed-writer-" + Guid.NewGuid().ToString("D")
             } };
-            _ = ledger.RegisterManagedWriter(runnable.Identity, runnable.AuthenticatedCallerSid);
+            var registeredRunnable = ledger.RegisterManagedWriter(runnable.Identity, runnable.AuthenticatedCallerSid);
+            runnable = runnable with { Identity = registeredRunnable.Identity };
             var prepared = ledger.Prepare(runnable);
             if (prepared.Phase != ServiceAttemptPhase.Prepared || !prepared.ReservationHeld
                 || !ledger.TryCommitDispatch(runnable.Identity, runnable.AuthenticatedCallerSid, runnable.OperationDigest))
