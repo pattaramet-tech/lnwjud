@@ -35,6 +35,16 @@ internal sealed class ServiceAttemptLedgerPersistence
     private readonly string filename;
     internal string OutputStoreDirectory => Path.Combine(Path.GetDirectoryName(filename)!, "output");
 
+    // Independent, service-owned evidence. Use the existing protected store and
+    // crash-safe write/readback implementation; callers never supply this path.
+    internal ServiceAttemptLedgerPersistence ManagedWriterWitness(string attemptId)
+    {
+        var key = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(attemptId))).ToLowerInvariant();
+        return new ServiceAttemptLedgerPersistence(Path.Combine(
+            Path.GetDirectoryName(filename)!, "managed-writer-witness-" + key + ".json"));
+    }
+
     internal ServiceAttemptLedgerPersistence(string filename)
     {
         if (!Path.IsPathFullyQualified(filename)) throw new IOException("ATTEMPT_STORE_PATH_INVALID");

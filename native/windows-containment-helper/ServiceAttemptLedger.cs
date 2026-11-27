@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
 
 namespace Lnwjud.Containment;
 
@@ -61,7 +62,8 @@ internal sealed record ServiceAttemptRequest(
     bool HoldForImport = false,
     bool CancellationRequested = false,
     bool PublicationCommitted = false,
-    bool RegistryOnly = false);
+    bool RegistryOnly = false,
+    Guid? NativeDispatchBootId = null);
 
 internal sealed class ServiceAttemptLedger
 {
@@ -85,6 +87,7 @@ internal sealed class ServiceAttemptLedger
     private bool unavailable;
 #if NATIVE_CONTAINMENT_TESTS
     internal Action? AfterImportHoldClearedForTest { get; set; }
+    internal Func<Guid>? BootIdentityForTest { get; set; }
 #endif
 
     internal ServiceAttemptLedger() { }
@@ -161,6 +164,8 @@ internal sealed class ServiceAttemptLedger
             EnsureAvailable();
             if (attempts.ContainsKey(identity.AttemptId)) throw new IOException("ATTEMPT_ID_CONFLICT");
             var entry = new Entry(request) { Phase = ServiceAttemptPhase.AdmissionRegistered, ReservationHeld = false };
+            if (ReadManagedWitness(identity, callerSid) is not null) throw new IOException("ATTEMPT_ID_CONFLICT");
+            WriteManagedWitness(entry);
             attempts.Add(identity.AttemptId, entry);
             Persist();
             return Observe(entry);
@@ -169,6 +174,100 @@ internal sealed class ServiceAttemptLedger
 
     private static bool IsManagedWriter(ServiceAttemptIdentity identity) =>
         identity.ReservationId.StartsWith("managed-writer-", StringComparison.Ordinal);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BootEnvironmentInformation
+    {
+        internal Guid BootIdentifier;
+        internal uint FirmwareType;
+        internal ulong BootFlags;
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQuerySystemInformation(int informationClass,
+        out BootEnvironmentInformation information, int length, out int returned);
+
+    private Guid ReadBootIdentity()
+    {
+#if NATIVE_CONTAINMENT_TESTS
+        if (BootIdentityForTest is not null)
+        {
+            var test = BootIdentityForTest();
+            if (test != Guid.Empty) return test;
+            throw new IOException("SERVICE_RECOVERY_BOOT_UNVERIFIED");
+        }
+#endif
+        // SystemBootEnvironmentInformation: native boot GUID, not wall clock
+        // or a timestamp supplied by a host marker. Unknown is fail-closed.
+        if (!OperatingSystem.IsWindows()
+            || NtQuerySystemInformation(90, out var info, Marshal.SizeOf<BootEnvironmentInformation>(), out _) != 0
+            || info.BootIdentifier == Guid.Empty)
+            throw new IOException("SERVICE_RECOVERY_BOOT_UNVERIFIED");
+        return info.BootIdentifier;
+    }
+
+    private static PersistedServiceAttempt Snapshot(Entry entry) => new(
+        entry.Request, entry.Phase, entry.TargetPid, entry.Outcome, entry.ExitCode,
+        entry.ActiveProcesses, entry.Reason, entry.ReservationHeld);
+
+    private Entry? ReadManagedWitness(ServiceAttemptIdentity identity, string callerSid)
+    {
+        if (persistence is null) return null;
+        var records = persistence.ManagedWriterWitness(identity.AttemptId).Load();
+        if (records.Length == 0) return null;
+        if (records.Length != 1) throw new IOException("SERVICE_WRITER_WITNESS_INVALID");
+        var stored = records[0];
+        ValidateStored(stored);
+        if (stored.Request.Identity != identity
+            || !String.Equals(stored.Request.AuthenticatedCallerSid, callerSid, StringComparison.Ordinal))
+            throw new UnauthorizedAccessException("ATTEMPT_OWNER_MISMATCH");
+        if (!IsManagedWriter(identity) || stored.Request.RegistryOnly
+            || !String.Equals(stored.Request.ReservationKey, GlobalReservationKey, StringComparison.OrdinalIgnoreCase)
+            || stored.Phase is not (ServiceAttemptPhase.AdmissionRegistered or ServiceAttemptPhase.DispatchCommitted
+                or ServiceAttemptPhase.LaunchNotStarted or ServiceAttemptPhase.TerminalVerified)
+            || stored.Phase == ServiceAttemptPhase.DispatchCommitted && stored.Request.NativeDispatchBootId is null)
+            throw new IOException("SERVICE_WRITER_WITNESS_INVALID");
+        return new Entry(stored.Request) { Phase = stored.Phase, TargetPid = stored.TargetPid,
+            Outcome = stored.Outcome, ExitCode = stored.ExitCode, ActiveProcesses = stored.ActiveProcesses,
+            Reason = stored.Reason, ReservationHeld = stored.ReservationHeld };
+    }
+
+    private void WriteManagedWitness(Entry entry)
+    {
+        if (persistence is null) throw new IOException("SERVICE_WRITER_WITNESS_UNAVAILABLE");
+        persistence.ManagedWriterWitness(entry.Request.Identity.AttemptId).Save([Snapshot(entry)]);
+    }
+
+    private static bool IsVerifiedWitness(Entry witness) =>
+        !witness.Request.HoldForImport && witness.Phase is ServiceAttemptPhase.LaunchNotStarted or ServiceAttemptPhase.TerminalVerified;
+
+    private static void RequireAbsentJob(ServiceAttemptIdentity identity)
+    {
+        if (ContainedProcess.QueryJob(ContainedProcess.GetJobName(identity.AttemptId)).Status
+            != ContainedProcess.JobProbeStatus.NotFound)
+            throw new IOException("SERVICE_RECOVERY_JOB_UNVERIFIED");
+    }
+
+    private ServiceAttemptObservation RestoreVerifiedWitness(Entry witness)
+    {
+        if (!IsVerifiedWitness(witness)) throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+        RequireAbsentJob(witness.Request.Identity);
+        witness.ReservationHeld = false;
+        attempts[witness.Request.Identity.AttemptId] = witness;
+        Persist();
+        return Observe(witness);
+    }
+
+    private ServiceAttemptObservation AbortRegisteredWitness(Entry witness)
+    {
+        if (witness.Phase != ServiceAttemptPhase.AdmissionRegistered || witness.Request.HoldForImport)
+            throw new IOException("SERVICE_RECOVERY_DISPATCH_UNVERIFIED");
+        RequireAbsentJob(witness.Request.Identity);
+        witness.Phase = ServiceAttemptPhase.LaunchNotStarted;
+        witness.ReservationHeld = false;
+        WriteManagedWitness(witness); // durable no-replay evidence before main ledger
+        return RestoreVerifiedWitness(witness);
+    }
 
     internal ServiceAttemptObservation Prepare(ServiceAttemptRequest request)
     {
@@ -185,6 +284,9 @@ internal sealed class ServiceAttemptLedger
                         || !String.Equals(existing.Request.ReservationKey, request.ReservationKey, StringComparison.OrdinalIgnoreCase)
                         || !request.Shared || request.HoldForImport || request.RegistryOnly)
                         throw new IOException("ATTEMPT_ID_CONFLICT");
+                    var witness = ReadManagedWitness(request.Identity, request.AuthenticatedCallerSid);
+                    if (witness?.Phase != ServiceAttemptPhase.AdmissionRegistered)
+                        throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
                     if (HasConflict(request, request.Identity.AttemptId)) throw new IOException("WRITER_RESERVATION_BUSY");
                     existing.Request = request;
                     existing.Phase = ServiceAttemptPhase.Prepared;
@@ -211,14 +313,50 @@ internal sealed class ServiceAttemptLedger
     {
         var request = new ServiceAttemptRequest(identity, callerSid, GlobalReservationKey, identity.RequestDigest, Shared: true);
         Validate(request);
-        if (recordedAt.Offset != TimeSpan.Zero || recordedAt > DateTimeOffset.UtcNow
-            || bootTime <= recordedAt.AddSeconds(5))
+        if (!IsManagedWriter(identity) && (recordedAt.Offset != TimeSpan.Zero || recordedAt > DateTimeOffset.UtcNow
+            || bootTime <= recordedAt.AddSeconds(5)))
             throw new IOException("SERVICE_RECOVERY_NEW_BOOT_REQUIRED");
         if (job.Status != ContainedProcess.JobProbeStatus.NotFound)
             throw new IOException("SERVICE_RECOVERY_JOB_UNVERIFIED");
         lock (gate)
         {
             EnsureAvailable();
+            if (IsManagedWriter(identity))
+            {
+                // Never trust a host clock to authorize recovery. An exact
+                // protected witness is mandatory, even when the main ledger
+                // was lost. Live phases never enter reboot reconciliation.
+                if (attempts.TryGetValue(identity.AttemptId, out var managedExisting))
+                {
+                    _ = Require(identity, callerSid);
+                    if (managedExisting.Request.HoldForImport
+                        || managedExisting.Phase is ServiceAttemptPhase.Running or ServiceAttemptPhase.DispatchCommitted)
+                        throw new IOException("SERVICE_RECOVERY_EXISTING_ATTEMPT_UNVERIFIED");
+                    if (managedExisting.Phase is ServiceAttemptPhase.TerminalVerified or ServiceAttemptPhase.LaunchNotStarted)
+                    {
+                        if (managedExisting.ReservationHeld) _ = Release(identity, callerSid);
+                        return Observe(managedExisting);
+                    }
+                }
+                var witness = ReadManagedWitness(identity, callerSid)
+                    ?? throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+                if (witness.Request.HoldForImport) throw new IOException("SERVICE_RECOVERY_IMPORT_HOLD_UNVERIFIED");
+                if (IsVerifiedWitness(witness)) return RestoreVerifiedWitness(witness);
+                if (witness.Phase == ServiceAttemptPhase.AdmissionRegistered) return AbortRegisteredWitness(witness);
+                if (witness.Phase != ServiceAttemptPhase.DispatchCommitted
+                    || witness.Request.NativeDispatchBootId is not { } dispatchBoot || dispatchBoot == Guid.Empty)
+                    throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+                if (dispatchBoot == ReadBootIdentity()) throw new IOException("SERVICE_RECOVERY_NEW_BOOT_REQUIRED");
+                RequireAbsentJob(identity);
+                witness.Phase = ServiceAttemptPhase.TerminalVerified;
+                witness.Outcome = ServiceProcessOutcome.Interrupted;
+                witness.ExitCode = 125;
+                witness.ActiveProcesses = 0;
+                witness.Reason = null;
+                witness.ReservationHeld = false;
+                WriteManagedWitness(witness);
+                return RestoreVerifiedWitness(witness);
+            }
             if (attempts.TryGetValue(identity.AttemptId, out var existing))
             {
                 if (existing.Request.Identity != identity
@@ -249,9 +387,6 @@ internal sealed class ServiceAttemptLedger
                 }
                 throw new IOException("SERVICE_RECOVERY_EXISTING_ATTEMPT_UNVERIFIED");
             }
-            // An unauthenticated host timestamp cannot bind a missing managed
-            // attempt to a prior boot. No native record means no owner proof.
-            if (IsManagedWriter(identity)) throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
             var recovered = new Entry(request)
             {
                 Phase = ServiceAttemptPhase.TerminalVerified,
@@ -275,6 +410,18 @@ internal sealed class ServiceAttemptLedger
                 throw new IOException("SERVICE_OPERATION_DIGEST_MISMATCH");
             if (entry.Phase == ServiceAttemptPhase.Prepared)
             {
+                if (IsManagedWriter(identity))
+                {
+                    var witness = ReadManagedWitness(identity, callerSid);
+                    if (witness?.Phase != ServiceAttemptPhase.AdmissionRegistered)
+                        throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+                    var boot = ReadBootIdentity();
+                    witness.Request = entry.Request with { NativeDispatchBootId = boot };
+                    witness.Phase = ServiceAttemptPhase.DispatchCommitted;
+                    witness.ReservationHeld = true;
+                    WriteManagedWitness(witness); // write-ahead: no launch until both stores persist
+                    entry.Request = witness.Request;
+                }
                 entry.Phase = ServiceAttemptPhase.DispatchCommitted;
                 Persist();
                 return true;
@@ -316,17 +463,14 @@ internal sealed class ServiceAttemptLedger
                     && !String.Equals(existing.Request.OperationDigest, request.OperationDigest, StringComparison.Ordinal)
                     && !String.Equals(identity.RequestDigest, request.OperationDigest, StringComparison.Ordinal))
                     throw new IOException("SERVICE_OPERATION_DIGEST_MISMATCH");
-                if (existing.Phase == ServiceAttemptPhase.AdmissionRegistered)
+                if (IsManagedWriter(identity) && existing.Phase is ServiceAttemptPhase.AdmissionRegistered or ServiceAttemptPhase.Prepared)
                 {
-                    // Positive durable no-dispatch evidence, plus an exact Job
-                    // check. The gate prevents Prepare/dispatch racing this abort.
-                    var job = ContainedProcess.QueryJob(ContainedProcess.GetJobName(identity.AttemptId));
-                    if (job.Status != ContainedProcess.JobProbeStatus.NotFound)
-                        throw new IOException("SERVICE_RECOVERY_JOB_UNVERIFIED");
-                    existing.Phase = ServiceAttemptPhase.LaunchNotStarted;
-                    Persist();
+                    var witness = ReadManagedWitness(identity, request.AuthenticatedCallerSid)
+                        ?? throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+                    if (IsVerifiedWitness(witness)) return RestoreVerifiedWitness(witness);
+                    return AbortRegisteredWitness(witness);
                 }
-                else if (existing.Phase == ServiceAttemptPhase.Prepared)
+                if (existing.Phase == ServiceAttemptPhase.Prepared)
                 {
                     existing.Phase = ServiceAttemptPhase.LaunchNotStarted;
                     Persist();
@@ -335,8 +479,15 @@ internal sealed class ServiceAttemptLedger
             }
 
             if (HasConflict(request)) throw new IOException("WRITER_RESERVATION_BUSY");
-            // Never mint a managed-writer no-launch proof from a missing record.
-            if (IsManagedWriter(identity)) throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+            // Missing main ledger alone is not evidence. An independent exact
+            // native no-dispatch/terminal witness can recover the binding.
+            if (IsManagedWriter(identity))
+            {
+                var witness = ReadManagedWitness(identity, request.AuthenticatedCallerSid)
+                    ?? throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+                if (IsVerifiedWitness(witness)) return RestoreVerifiedWitness(witness);
+                return AbortRegisteredWitness(witness);
+            }
             var tombstone = new Entry(request) { Phase = ServiceAttemptPhase.LaunchNotStarted };
             attempts.Add(identity.AttemptId, tombstone);
             Persist();
@@ -396,6 +547,15 @@ internal sealed class ServiceAttemptLedger
             }
             if (entry.Phase is not (ServiceAttemptPhase.DispatchCommitted or ServiceAttemptPhase.Running or ServiceAttemptPhase.TerminationUnknown))
                 throw new IOException("ATTEMPT_PHASE_CONFLICT");
+            if (IsManagedWriter(identity))
+            {
+                // Record only actual native zero-active termination. Never
+                // clear an import hold via this independent receipt.
+                var terminalWitness = new Entry(entry.Request) { Phase = ServiceAttemptPhase.TerminalVerified,
+                    TargetPid = entry.TargetPid, Outcome = outcome, ExitCode = exitCode,
+                    ActiveProcesses = 0, ReservationHeld = entry.Request.HoldForImport };
+                if (persistence is not null) WriteManagedWitness(terminalWitness);
+            }
             entry.Phase = ServiceAttemptPhase.TerminalVerified;
             entry.Outcome = outcome;
             entry.ExitCode = exitCode;
@@ -434,6 +594,13 @@ internal sealed class ServiceAttemptLedger
                 throw new IOException("ATTEMPT_IMPORT_PHASE_INVALID");
             var exclusive = entry.Request with { ReservationKey = GlobalReservationKey, Shared = false, HoldForImport = true };
             if (HasConflict(exclusive, identity.AttemptId)) throw new IOException("WRITER_RESERVATION_BUSY");
+            if (IsManagedWriter(identity))
+            {
+                var witness = ReadManagedWitness(identity, callerSid)
+                    ?? throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+                witness.Request = exclusive;
+                WriteManagedWitness(witness); // hold is durable before import publication can begin
+            }
             entry.Request = exclusive;
             Persist();
         }
@@ -448,7 +615,16 @@ internal sealed class ServiceAttemptLedger
             if (!entry.Request.CancellationRequested)
             {
                 entry.Request = entry.Request with { CancellationRequested = true };
-                if (entry.Phase == ServiceAttemptPhase.Prepared) entry.Phase = ServiceAttemptPhase.LaunchNotStarted;
+                if (entry.Phase == ServiceAttemptPhase.Prepared)
+                {
+                    if (IsManagedWriter(identity))
+                    {
+                        var witness = ReadManagedWitness(identity, callerSid)
+                            ?? throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+                        return AbortRegisteredWitness(witness);
+                    }
+                    entry.Phase = ServiceAttemptPhase.LaunchNotStarted;
+                }
                 Persist();
             }
             if (entry.Phase == ServiceAttemptPhase.LaunchNotStarted) _ = Release(identity, callerSid);
@@ -521,8 +697,25 @@ internal sealed class ServiceAttemptLedger
         {
             EnsureAvailable();
             if (IsManagedWriter(identity) && !attempts.ContainsKey(identity.AttemptId))
-                throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
-            return Observe(Require(identity, callerSid));
+            {
+                var witness = ReadManagedWitness(identity, callerSid)
+                    ?? throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+                if (witness.Request.HoldForImport) throw new IOException("SERVICE_RECOVERY_IMPORT_HOLD_UNVERIFIED");
+                if (IsVerifiedWitness(witness)) return RestoreVerifiedWitness(witness);
+                if (witness.Phase == ServiceAttemptPhase.AdmissionRegistered) return Observe(witness);
+                return Observe(witness) with { Phase = ServiceAttemptPhase.TerminationUnknown,
+                    Reason = "SERVICE_RECOVERY_NATIVE_BOOT_REQUIRED" };
+            }
+            var entry = Require(identity, callerSid);
+            // A crash after the independent terminal write but before the main
+            // ledger commit can be recovered without inventing an exit code.
+            if (IsManagedWriter(identity) && !entry.Request.HoldForImport
+                && entry.Phase is ServiceAttemptPhase.AdmissionRegistered or ServiceAttemptPhase.Prepared or ServiceAttemptPhase.TerminationUnknown)
+            {
+                var witness = ReadManagedWitness(identity, callerSid);
+                if (witness is not null && IsVerifiedWitness(witness)) return RestoreVerifiedWitness(witness);
+            }
+            return Observe(entry);
         }
     }
 
@@ -664,6 +857,7 @@ internal sealed class ServiceAttemptLedger
             || !Path.IsPathFullyQualified(request.ReservationKey)
             || request.HoldForImport && request.Shared
             || request.RegistryOnly != IsMcp(identity) || request.RegistryOnly && (!request.Shared || request.HoldForImport)
+            || request.NativeDispatchBootId == Guid.Empty
             || !Digest.IsMatch(request.OperationDigest))
             throw new IOException("ATTEMPT_REQUEST_INVALID");
     }

@@ -792,7 +792,8 @@ internal static class NativeTests
         Directory.CreateDirectory(directory);
         try
         {
-            var persistence = new ServiceAttemptLedgerPersistence(Path.Combine(directory, "ledger.json"));
+            var ledgerPath = Path.Combine(directory, "ledger.json");
+            var persistence = new ServiceAttemptLedgerPersistence(ledgerPath);
             var request = NewServiceAttemptRequest(Guid.NewGuid().ToString("D"), ServiceAttemptLedger.GlobalReservationKey) with { Shared = true };
             request = request with { Identity = request.Identity with { ReservationId = "managed-writer-" + Guid.NewGuid().ToString("D") } };
             var ledger = new ServiceAttemptLedger(persistence);
@@ -806,6 +807,12 @@ internal static class NativeTests
             ledger = new ServiceAttemptLedger(persistence);
             if (ledger.Inspect(request.Identity, request.AuthenticatedCallerSid) != registration)
                 throw new Exception("Registration was not durable before marker publication");
+            // Lose only the disposable main ledger; the protected registration
+            // witness is independent and no launch has been committed.
+            File.Delete(ledgerPath);
+            ledger = new ServiceAttemptLedger(persistence);
+            if (ledger.Inspect(request.Identity, request.AuthenticatedCallerSid) != registration)
+                throw new Exception("Independent registration witness was lost with the ledger");
             ExpectFailure<UnauthorizedAccessException>(() => ledger.Inspect(request.Identity, "S-1-5-21-9999"), "ATTEMPT_OWNER_MISMATCH");
             var abort = ledger.AbortBeforeLaunch(request with { OperationDigest = request.Identity.RequestDigest });
             if (abort.Phase != ServiceAttemptPhase.LaunchNotStarted || abort.ReservationHeld)
@@ -823,12 +830,31 @@ internal static class NativeTests
             var registeredRunnable = ledger.RegisterManagedWriter(runnable.Identity, runnable.AuthenticatedCallerSid);
             runnable = runnable with { Identity = registeredRunnable.Identity };
             var prepared = ledger.Prepare(runnable);
+            var oldBoot = Guid.NewGuid();
+            ledger.BootIdentityForTest = () => oldBoot;
             if (prepared.Phase != ServiceAttemptPhase.Prepared || !prepared.ReservationHeld
                 || !ledger.TryCommitDispatch(runnable.Identity, runnable.AuthenticatedCallerSid, runnable.OperationDigest))
                 throw new Exception("Exact registered binding did not promote to dispatch");
             var dispatched = ledger.AbortBeforeLaunch(runnable);
             if (dispatched.Phase != ServiceAttemptPhase.DispatchCommitted || !dispatched.ReservationHeld)
                 throw new Exception("Committed dispatch was released by abort");
+            File.Delete(ledgerPath);
+            ledger = new ServiceAttemptLedger(persistence) { BootIdentityForTest = () => oldBoot };
+            var now = DateTimeOffset.UtcNow;
+            var absentJob = ContainedProcess.QueryJob(ContainedProcess.GetJobName(runnable.Identity.AttemptId));
+            ExpectFailure<IOException>(() => ledger.RecoverAfterReboot(runnable.Identity, runnable.AuthenticatedCallerSid,
+                now.AddDays(-1), now, absentJob), "SERVICE_RECOVERY_NEW_BOOT_REQUIRED");
+            ExpectFailure<UnauthorizedAccessException>(() => ledger.RecoverAfterReboot(runnable.Identity, "S-1-5-21-9999",
+                now.AddDays(-1), now, absentJob), "ATTEMPT_OWNER_MISMATCH");
+            ledger.BootIdentityForTest = () => Guid.NewGuid();
+            var recovered = ledger.RecoverAfterReboot(runnable.Identity, runnable.AuthenticatedCallerSid,
+                now.AddDays(-1), now, absentJob);
+            if (recovered.Phase != ServiceAttemptPhase.TerminalVerified || recovered.Outcome != ServiceProcessOutcome.Interrupted
+                || recovered.ExitCode != 125 || recovered.ReservationHeld)
+                throw new Exception("New boot with exact witness did not verify interrupted termination");
+            if (ledger.RecoverAfterReboot(runnable.Identity, runnable.AuthenticatedCallerSid,
+                now.AddDays(-1), now, absentJob) != recovered)
+                throw new Exception("Missing ledger recovery was not idempotent");
         }
         finally { Directory.Delete(directory, true); }
     }
