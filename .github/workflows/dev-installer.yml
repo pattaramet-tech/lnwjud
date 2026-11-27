@@ -1,8 +1,6 @@
 name: Dev Windows Installer
 
 on:
-  push:
-    branches: ['fix/native-missing-attempt-recovery']
   workflow_dispatch:
 
 permissions:
