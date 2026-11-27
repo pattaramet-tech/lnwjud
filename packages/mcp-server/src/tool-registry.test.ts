@@ -1846,6 +1846,9 @@ describe('MCP tool registry', () => {
       workspaceId: 'workspace-a', operation: 'run', executable: 'node', arguments: ['script.js'],
     })).resolves.toMatchObject({ isError: true, structuredContent: { error: { code: 'ENGINEERING_PREFLIGHT_REQUIRED' } } });
     await expect(registry.invoke('shell', {
+      workspaceId: 'workspace-a', operation: 'run', executable: 'git', arguments: ['worktree', 'list', '--porcelain'],
+    })).resolves.toMatchObject({ isError: true, structuredContent: { error: { code: 'ENGINEERING_PREFLIGHT_REQUIRED' } } });
+    await expect(registry.invoke('shell', {
       workspaceId: 'workspace-a', operation: 'run', executable: 'node', arguments: ['script.js'],
       engineeringTask: { goalId: 'engineering-goal-1', policyDigest: 'digest-1', goalRevision: 2, userIntentRevision: 0 },
       goalLease: { goalId: 'engineering-goal-1', leaseToken: 'lease-token-1', leaseGeneration: 4 },

@@ -14,6 +14,15 @@ interface MutationCase {
 
 const cases: readonly MutationCase[] = [
   { label: 'read-only git status', tool: 'git', input: { args: ['status', '--short'] }, permission: 'EXECUTE', kind: 'read' },
+  { label: 'read-only worktree inventory', tool: 'git', input: { args: ['worktree', 'list', '--porcelain', '-z'] }, permission: 'EXECUTE', kind: 'read' },
+  { label: 'worktree add', tool: 'git', input: { args: ['worktree', 'add', 'linked'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },
+  { label: 'worktree remove', tool: 'git', input: { args: ['worktree', 'remove', 'linked'] }, permission: 'EXECUTE', kind: 'delete' },
+  { label: 'worktree prune preview', tool: 'git', input: { args: ['worktree', 'prune', '--dry-run'] }, permission: 'EXECUTE', kind: 'delete' },
+  { label: 'worktree move', tool: 'git', input: { args: ['worktree', 'move', 'linked', 'new'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },
+  { label: 'worktree repair', tool: 'git', input: { args: ['worktree', 'repair', 'linked'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },
+  { label: 'worktree lock', tool: 'git', input: { args: ['worktree', 'lock', 'linked'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },
+  { label: 'worktree unlock', tool: 'git', input: { args: ['worktree', 'unlock', 'linked'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },
+  { label: 'unrecognized worktree list option', tool: 'git', input: { args: ['worktree', 'list', '--unknown'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },
   { label: 'git index replacement', tool: 'git', input: { args: ['add', '--', 'src/a.ts'] }, permission: 'EXECUTE', kind: 'replace' },
   { label: 'git scope override before clean', tool: 'git', input: { args: ['-C', 'E:\\outside', 'clean', '-fd'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },
   { label: 'git config alias with an operand', tool: 'git', input: { args: ['-c', 'alias.wipe=!rm -rf .', 'wipe'] }, permission: 'EXECUTE', kind: 'opaque_mutation' },

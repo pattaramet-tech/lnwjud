@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createProcessTreeTerminator, type ProcessTreeTerminator } from '@lnwjud/process';
+import path from 'node:path';
+import { createProcessTreeTerminator, PathExecutableResolver, type ProcessTreeTerminator } from '@lnwjud/process';
 
 export interface GitRunResult {
   readonly exitCode: number;
@@ -27,17 +28,28 @@ export class DirectGitRunner implements GitRunner {
     private readonly terminationRetryMs = DEFAULT_TERMINATION_RETRY_MS,
   ) {}
 
-  public run(args: readonly string[], cwd: string, options: GitRunOptions = {}): Promise<GitRunResult> {
+  public async run(args: readonly string[], cwd: string, options: GitRunOptions = {}): Promise<GitRunResult> {
     if (options.signal?.aborted === true) {
-      return Promise.resolve({ exitCode: -1, stdout: '', stderr: 'Git command cancelled' });
+      return { exitCode: -1, stdout: '', stderr: 'Git command cancelled' };
+    }
+    let executable = 'git';
+    const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+    if (args[0] === 'worktree' && args[1] === 'list') {
+      // Do not let a workspace-local executable or relative PATH entry turn
+      // typed read-only Git inspection into execution of workspace code.
+      const hostPath = (env.Path ?? env.PATH ?? '').split(path.delimiter).filter(path.isAbsolute).join(path.delimiter);
+      const git = await new PathExecutableResolver({ PATH: hostPath }).resolve(process.platform === 'win32' ? 'git.exe' : 'git');
+      if (!git.ok) return { exitCode: -1, stdout: '', stderr: git.error.message };
+      executable = git.value;
+      Object.assign(env, { GIT_OPTIONAL_LOCKS: '0', GIT_NO_LAZY_FETCH: '1', GIT_PAGER: '' });
     }
     const timeoutMs = clampTimeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     return new Promise((resolve) => {
       let child: ChildProcess;
       try {
-        child = spawn('git', [...args], {
+        child = spawn(executable, [...args], {
           cwd,
-          env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+          env,
           shell: false,
           detached: process.platform !== 'win32',
           windowsHide: true,

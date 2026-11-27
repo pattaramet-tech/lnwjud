@@ -26,6 +26,7 @@ export function isProvablyReadOnlyGitInvocation(args: readonly string[]): boolea
   if (ALWAYS_READ_ONLY_GIT_SUBCOMMANDS.has(first)) return true;
   if (first === 'branch') return isReadOnlyBranch(rest);
   if (first === 'config') return isReadOnlyConfig(rest);
+  if (args[0] === 'worktree') return isReadOnlyWorktree(rest);
   if (first === 'remote') return rest.length === 0 || ['-v', '--verbose', 'get-url', 'show'].includes(rest[0]!.toLowerCase());
   if (first === 'reflog') return rest.length === 0 || ['show', 'exists'].includes(rest[0]!.toLowerCase());
   if (first === 'stash') return rest.length > 0 && ['list', 'show'].includes(rest[0]!.toLowerCase());
@@ -124,6 +125,13 @@ function isReadOnlyBranch(args: readonly string[]): boolean {
 function isReadOnlyConfig(args: readonly string[]): boolean {
   const lower = args.map((arg) => arg.toLowerCase());
   return lower.some((arg) => ['--get', '--get-all', '--get-regexp', '--list', '-l', '--show-origin', '--show-scope'].includes(arg));
+}
+
+function isReadOnlyWorktree([action, ...flags]: readonly string[]): boolean {
+  if (action !== 'list') return false;
+  if (flags.length === 0) return true;
+  if (flags.length === 1) return flags[0] === '-v' || flags[0] === '--verbose' || flags[0] === '--porcelain';
+  return flags.length === 2 && flags.includes('--porcelain') && flags.includes('-z');
 }
 
 function isReadOnlySymbolicRef(args: readonly string[]): boolean {

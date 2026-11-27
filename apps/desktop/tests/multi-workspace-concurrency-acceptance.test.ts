@@ -1,10 +1,11 @@
 import { execFile } from 'node:child_process';
-import { access, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { redactDiagnosticText } from '@lnwjud/application';
+import { SharedManagedWriterAdmission } from '@lnwjud/capabilities';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDesktopRuntime } from '../src/main/desktop-services.js';
 
@@ -101,6 +102,112 @@ describe('multi-workspace concurrency acceptance', () => {
       await removeRetentionFixture(kept, base);
     }
   });
+
+  it('lists linked worktrees from concurrent MCP sessions without entering either writer gate', async () => {
+    const fixture = createFixtureOwner();
+    const temporary = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-worktree-inspection-'));
+    fixture.track(temporary, 'worktree acceptance did not complete');
+    const root = await realpath(temporary);
+    const dataRoot = path.join(root, 'data');
+    const repository = path.join(root, 'repository');
+    const linked = path.join(root, 'linked');
+    await Promise.all([mkdir(dataRoot), mkdir(repository)]);
+    const gitOptions = { cwd: repository, windowsHide: true };
+    await execFileAsync('git', ['init', '--quiet'], gitOptions);
+    await execFileAsync('git', [
+      '-c', 'user.name=lnwjud acceptance', '-c', 'user.email=lnwjud-test@example.invalid', '-c', 'commit.gpgsign=false',
+      'commit', '--quiet', '--allow-empty', '-m', 'fixture',
+    ], gitOptions);
+    await execFileAsync('git', ['worktree', 'add', '--quiet', '--detach', linked, 'HEAD'], gitOptions);
+
+    const runtime = createDesktopRuntime(dataRoot, { hostMutationApprovalProvider: async () => true });
+    const clientA = new Client({ name: 'worktree-reader-a', version: '1.0.0' });
+    const clientB = new Client({ name: 'worktree-reader-b', version: '1.0.0' });
+    const writerId = 'fixture-writer';
+    const writerSession = 'fixture-writer-session';
+    const workspaceLeases = runtime.mcpServices.workspaceWriterLease!;
+    let releaseWriterLease: (() => Promise<unknown>) | undefined;
+    let releaseReservation: (() => Promise<void>) | undefined;
+    let complete = false;
+
+    try {
+      const workspaceA = await runtime.services.addWorkspace({ rootPath: repository });
+      const workspaceB = await runtime.services.addWorkspace({ rootPath: linked });
+      expect(workspaceA.id).not.toBe(workspaceB.id);
+      const { url } = await runtime.services.startMcp({ workspaceId: workspaceA.id });
+      if (url === null) throw new Error('Desktop MCP listener did not start');
+      const transportA = new StreamableHTTPClientTransport(new URL(url));
+      const transportB = new StreamableHTTPClientTransport(new URL(url));
+      await Promise.all([clientA.connect(transportA), clientB.connect(transportB)]);
+      expect(transportA.sessionId).toEqual(expect.any(String));
+      expect(transportB.sessionId).toEqual(expect.any(String));
+      expect(transportA.sessionId).not.toBe(transportB.sessionId);
+
+      const lease = await workspaceLeases.acquire(workspaceA.id, writerId, writerSession, 120);
+      if (!lease.ok) throw new Error(lease.error.message);
+      releaseWriterLease = () => workspaceLeases.release(workspaceA.id, writerId, writerSession, lease.value);
+      const admission = new SharedManagedWriterAdmission(path.join(dataRoot, 'background-tasks'));
+      const reservation = await admission.enter({
+        actorClientId: writerId, actorSessionId: writerSession, workspaceId: workspaceA.id, kind: 'synchronous_mutation',
+      });
+      if (!reservation.ok) throw new Error(reservation.error.message);
+      releaseReservation = reservation.value.releaseAfterVerifiedTermination;
+
+      const beforeA = await workspaceLeases.inspect(workspaceA.id);
+      const beforeB = await workspaceLeases.inspect(workspaceB.id);
+      expect(beforeA).toMatchObject({ ok: true, value: { state: 'active', activeCalls: 0, generation: lease.value.generation } });
+      expect(beforeB).toMatchObject({ ok: true, value: { state: 'unleased', activeCalls: 0, generation: 0 } });
+      const inspectReservations = async (): Promise<unknown> => structuredRecord(await clientA.callTool({ name: 'task_list' })).admission;
+      const beforeReservations = await inspectReservations();
+      expect(beforeReservations).toMatchObject({ managed_writer_reservations: 1, durable_shell_reservations: 0, unresolved_reservations: 1 });
+
+      const begin = vi.spyOn(workspaceLeases, 'begin');
+      const enter = vi.spyOn(SharedManagedWriterAdmission.prototype, 'enter');
+      try {
+        const responses = await Promise.all([
+          clientA.callTool({ name: 'git', arguments: { workspaceId: workspaceA.id, args: ['worktree', 'list', '--porcelain'] } }),
+          clientB.callTool({ name: 'git', arguments: { workspaceId: workspaceB.id, args: ['worktree', 'list', '--porcelain', '-z'] } }),
+        ]);
+        for (const [index, response] of responses.entries()) {
+          expect(response.isError, JSON.stringify(response.structuredContent)).not.toBe(true);
+          expect(structuredRecord(response).exitCode).toBe(0);
+          const worktrees = stringField(response, 'stdout').split(index === 0 ? /\r?\n/ : '\0')
+            .filter((field) => field.startsWith('worktree '))
+            .map((field) => path.basename(field.slice('worktree '.length)));
+          expect(worktrees.sort()).toEqual(['linked', 'repository']);
+        }
+        expect(begin).not.toHaveBeenCalled();
+        expect(enter).not.toHaveBeenCalled();
+        expect(await workspaceLeases.inspect(workspaceA.id)).toEqual(beforeA);
+        expect(await workspaceLeases.inspect(workspaceB.id)).toEqual(beforeB);
+        expect(await inspectReservations()).toEqual(beforeReservations);
+
+        const denied = await clientB.callTool({ name: 'git', arguments: {
+          workspaceId: workspaceA.id, args: ['worktree', 'add', '--detach', 'blocked-checkout', 'HEAD'], userConfirmed: true,
+        } });
+        expect(denied.isError, JSON.stringify(denied.structuredContent)).toBe(true);
+        expect(errorCode(denied)).toBe('CONFLICT');
+        expect(begin).toHaveBeenCalledTimes(1);
+        expect(enter).not.toHaveBeenCalled();
+        await expect(access(path.join(repository, 'blocked-checkout'))).rejects.toThrow();
+        expect(await inspectReservations()).toEqual(beforeReservations);
+        complete = true;
+      } finally {
+        begin.mockRestore();
+        enter.mockRestore();
+      }
+    } finally {
+      try {
+        await releaseReservation?.();
+        const released = await releaseWriterLease?.();
+        if (releaseWriterLease !== undefined) expect(released).toMatchObject({ ok: true });
+      } finally {
+        await Promise.allSettled([clientA.close(), clientB.close()]);
+        await runtime.close();
+        if (complete) fixture.complete();
+      }
+    }
+  }, 30_000);
 
   it('runs two real MCP sessions in parallel without mixing workspace or session ownership', async () => {
     const owner = createFixtureOwner();

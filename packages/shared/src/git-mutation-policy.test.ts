@@ -77,3 +77,43 @@ describe('prohibitedAgentGitInvocationReason', () => {
     expect(isProvablyReadOnlyGitInvocation(['commit', '-m', 'message'])).toBe(false);
   });
 });
+
+describe('worktree listing', () => {
+  it.each([
+    ['worktree', 'list'],
+    ['worktree', 'list', '-v'],
+    ['worktree', 'list', '--verbose'],
+    ['worktree', 'list', '--porcelain'],
+    ['worktree', 'list', '--porcelain', '-z'],
+    ['worktree', 'list', '-z', '--porcelain'],
+  ].map((args) => ({ args })))('recognizes $args as read-only', ({ args }) => {
+    expect(isProvablyReadOnlyGitInvocation(args)).toBe(true);
+    expect(prohibitedAgentGitInvocationReason(args)).toBeUndefined();
+  });
+
+  it.each([
+    ['worktree'],
+    ['worktree', 'add', 'tree'],
+    ['worktree', 'remove', 'tree'],
+    ['worktree', 'prune', '--dry-run'],
+    ['worktree', 'move', 'old', 'new'],
+    ['worktree', 'repair', 'tree'],
+    ['worktree', 'lock', 'tree'],
+    ['worktree', 'unlock', 'tree'],
+    ['worktree', 'List', '--porcelain'],
+    ['WORKTREE', 'list', '--porcelain'],
+    ['worktree', 'list', 'tree'],
+    ['worktree', 'list', '--'],
+    ['worktree', 'list', '--porcelain=true'],
+    ['worktree', 'list', '--porc'],
+    ['worktree', 'list', '--porcelain', '--verbose'],
+    ['worktree', 'list', '--porcelain', '--porcelain'],
+    ['worktree', 'list', '-z'],
+    ['worktree', 'list', '-v', '-z'],
+    ['worktree', 'list', '--unknown'],
+    ['-C', 'elsewhere', 'worktree', 'list'],
+    ['-c', 'alias.tree=!command', 'worktree', 'list'],
+  ].map((args) => ({ args })))('keeps $args outside the read-only contract', ({ args }) => {
+    expect(isProvablyReadOnlyGitInvocation(args)).toBe(false);
+  });
+});

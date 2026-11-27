@@ -2002,7 +2002,9 @@ function isInformationalCommandInvocation(toolName: string, input: unknown): boo
     if (basename === 'echo' || basename === 'where' || basename === 'which' || basename === 'pwd') return true;
     if (basename === 'cmd' && args.length >= 2 && args[0]?.toLowerCase() === '/c' && args[1]?.toLowerCase() === 'echo') return true;
     if (args.length === 1 && ['--version', '-v', '-V', '--help', '-h', 'version', 'help'].includes(args[0]!.toLowerCase())) return true;
-    if (basename === 'git') return isProvablyReadOnlyGitInvocation(args);
+    // A generic command can supply its own Git executable. Keep the typed
+    // worktree inspection exemption from expanding generic shell admission.
+    if (basename === 'git') return args[0] !== 'worktree' && isProvablyReadOnlyGitInvocation(args);
     if (basename === 'corepack' && args.length >= 2 && ['--version', '-v', '-V', '--help', '-h', 'version'].includes(args[args.length - 1]!.toLowerCase())) return true;
     if (basename === 'gh') {
       const lower = args.map((arg) => arg.toLowerCase());

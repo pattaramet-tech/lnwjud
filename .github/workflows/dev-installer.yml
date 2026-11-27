@@ -78,6 +78,22 @@ jobs:
           LNWJUD_COSIGN_PATH: cosign
         run: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 
+      - name: Verify and report exact Windows Setup SHA-256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = 'apps/desktop/dist/installers'
+          $installers = @(Get-ChildItem -LiteralPath $directory -Filter 'lnwjud-Setup-*.exe' -File)
+          if ($installers.Count -ne 1) { throw 'EXPECTED_ONE_NSIS_INSTALLER' }
+          $installer = $installers[0]
+          $provenance = Get-Content -LiteralPath (Join-Path $directory 'PROVENANCE.json') -Raw | ConvertFrom-Json
+          $recorded = @($provenance.artifacts | Where-Object { $_.name -ceq $installer.Name })
+          $sha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($provenance.source.commit -cne $env:GITHUB_SHA -or $recorded.Count -ne 1 -or $recorded[0].sha256 -cne $sha256) {
+            throw 'DEV_INSTALLER_SETUP_PROVENANCE_MISMATCH'
+          }
+          Write-Output "DEV_INSTALLER_SETUP_SHA256=$sha256 file=$($installer.Name) source=$env:GITHUB_SHA"
+
       - name: Verify silent current-user setup refuses without extracting application files
         shell: pwsh
         timeout-minutes: 3
@@ -106,7 +122,8 @@ jobs:
           }
           Write-Output 'SILENT_CURRENTUSER_CLEAN_REFUSAL_VERIFIED'
 
-      - name: Verify protected all-users silent install and uninstall on hosted Windows
+      - name: Verify protected all-users silent install on hosted Windows
+        id: protected_install
         shell: pwsh
         timeout-minutes: 6
         run: |
@@ -145,6 +162,22 @@ jobs:
               $serviceConfig.PathName -notlike "*lnwjud-containment.exe*") {
             throw 'ALLUSERS_PROTECTED_SERVICE_IDENTITY_INVALID'
           }
+          Write-Output 'ALLUSERS_SILENT_INSTALL_PROTECTED_SERVICE_VERIFIED'
+
+      - name: Verify concurrent MCP sessions and workspace writers
+        shell: pwsh
+        run: pnpm --filter @lnwjud/desktop exec vitest run --config vitest.config.ts --fileParallelism=false tests/multi-workspace-concurrency-acceptance.test.ts
+
+      - name: Verify protected all-users silent uninstall on hosted Windows
+        if: ${{ !cancelled() && steps.protected_install.outcome == 'success' }}
+        shell: pwsh
+        timeout-minutes: 6
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = Join-Path $env:ProgramFiles 'lnwjud'
+          $application = Join-Path $target 'lnwjud.exe'
+          $uninstaller = Join-Path $target 'uninstall.exe'
+          $helper = Join-Path $target 'resources/native-containment/lnwjud-containment.exe'
           $remover = Start-Process -FilePath $uninstaller -ArgumentList @('/S', '/allusers') -PassThru -WindowStyle Hidden
           if (-not $remover.WaitForExit(120000)) {
             $remover.Kill()
