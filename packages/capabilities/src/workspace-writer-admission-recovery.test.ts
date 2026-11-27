@@ -138,7 +138,7 @@ function createMockAuthority(root: string): MockAuthorityContext {
     getCancelledAttempts: () => [...cancelled],
     getRecoveryRecordedAt: () => recoveryRecordedAt,
     getAbortCalls: () => abortCalls,
-    loseAfterNextNoLaunchInspect: () => { loseAfterNoLaunchInspect = true; },
+    loseAfterNextNoLaunchInspect: (): void => { loseAfterNoLaunchInspect = true; },
   };
 }
 
