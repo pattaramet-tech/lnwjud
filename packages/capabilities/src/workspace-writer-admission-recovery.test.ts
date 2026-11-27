@@ -19,11 +19,12 @@ afterEach(async () => {
 interface MockAuthorityContext {
   readonly authority: WindowsNativeAuthority;
   readonly setPhase: (phase: number, details?: { outcome?: number; exitCode?: number; targetPid?: number; reason?: string }) => void;
-  readonly setAttemptLost: (lost: boolean) => void;
+  readonly setAttemptLost: (lost: boolean, reason?: string) => void;
   readonly setRestartUnknown: (unknown: boolean) => void;
   readonly setRecoveryJobActive: (active: boolean) => void;
   readonly getCancelledAttempts: () => readonly string[];
   readonly getRecoveryRecordedAt: () => string | undefined;
+  readonly getAbortCalls: () => number;
 }
 
 function createMockAuthority(root: string): MockAuthorityContext {
@@ -33,6 +34,8 @@ function createMockAuthority(root: string): MockAuthorityContext {
   let currentTargetPid = 12345;
   let currentReason: string | undefined;
   let attemptLost = false;
+  let missingReason = 'SERVICE_ATTEMPT_NOT_FOUND';
+  let abortCalls = 0;
   let restartUnknown = false;
   let recoveryJobActive = false;
   let recoveryRecordedAt: string | undefined;
@@ -48,6 +51,7 @@ function createMockAuthority(root: string): MockAuthorityContext {
         return { identity: request.identity, phase: 4, outcome: 1, exitCode: -1, activeProcesses: 0, reservationHeld: false } as T;
       }
       if (request.command === 'abort') {
+        abortCalls++;
         if (attemptLost) {
           attemptLost = false;
           currentPhase = 2; // service creates tombstone with LaunchNotStarted
@@ -73,7 +77,7 @@ function createMockAuthority(root: string): MockAuthorityContext {
       }
       if (request.command === 'inspect') {
         if (attemptLost) {
-          throw new Error('SERVICE_OWNER_MISMATCH');
+          throw new Error(missingReason);
         }
         if (restartUnknown) {
           currentPhase = 5;
@@ -115,8 +119,9 @@ function createMockAuthority(root: string): MockAuthorityContext {
       if (details?.targetPid !== undefined) currentTargetPid = details.targetPid;
       if (details?.reason !== undefined) currentReason = details.reason;
     },
-    setAttemptLost: (lost: boolean): void => {
+    setAttemptLost: (lost: boolean, reason = 'SERVICE_ATTEMPT_NOT_FOUND'): void => {
       attemptLost = lost;
+      missingReason = reason;
     },
     setRestartUnknown: (unknown: boolean): void => {
       restartUnknown = unknown;
@@ -126,6 +131,7 @@ function createMockAuthority(root: string): MockAuthorityContext {
     },
     getCancelledAttempts: () => [...cancelled],
     getRecoveryRecordedAt: () => recoveryRecordedAt,
+    getAbortCalls: () => abortCalls,
   };
 }
 
@@ -733,7 +739,11 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
     await f.lease.end(workspaceId, 'call-gen2', lease2.value.generation);
   }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
 
-  it('13. Service Restart Recovery: recovers abandoned reservation when attempt is lost from service memory', async () => {
+  it.each([
+    { reason: 'SERVICE_ATTEMPT_NOT_FOUND', jobActive: false, allowed: true },
+    { reason: 'SERVICE_ATTEMPT_NOT_FOUND', jobActive: true, allowed: false },
+    { reason: 'SERVICE_OWNER_MISMATCH', jobActive: false, allowed: false },
+  ])('13. Service Restart Recovery: $reason, active Job=$jobActive', async ({ reason, jobActive, allowed }) => {
     const f = await fixture(10_000);
     const workspaceId = 'workspace-1';
     const clientId = 'client-1';
@@ -778,16 +788,22 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
       ownerWorkspaceId: workspaceId,
     });
 
-    // Simulate service restart: attempt is lost from service memory
-    f.mock.setAttemptLost(true);
+    // Missing attempt is not proof of no dispatch; only verified reboot may release.
+    f.mock.setAttemptLost(true, reason);
+    f.mock.setRecoveryJobActive(jobActive);
     f.advanceTime(35_000); // Expire lease
 
     const recovered = await f.lease.acquire(workspaceId, clientId, 'session-2', 60, true);
-    expect(recovered.ok).toBe(true);
-    if (!recovered.ok) return;
+    expect(f.mock.getAbortCalls()).toBe(0);
+    expect(recovered.ok).toBe(allowed);
+    if (!allowed) {
+      expect(f.mock.getRecoveryRecordedAt()).toBe(reason === 'SERVICE_OWNER_MISMATCH' ? undefined : metadata.started_at);
+      return;
+    }
+    if (!recovered.ok) throw new Error('Expected verified reboot recovery');
     expect(recovered.value.generation).toBe(2);
 
-    // Verify task.json was safely reconciled to failed with exit_code -1
+    // Verify task.json was safely reconciled to interrupted, not launch-not-started.
     const snapshot = await f.store.snapshot(taskId, undefined, { clientId, sessionId: 'session-2', workspaceId });
     expect(snapshot.ok).toBe(true);
     if (snapshot.ok) {
@@ -882,7 +898,11 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
     expect(recovered.error.details).toMatchObject({ blocker_state: 'unknown', terminal_proof: 'not_observed' });
   }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
 
-  it('15b. Missing service ledger with active native Job never releases writer', async () => {
+  it.each([
+    { inspectReason: 'SERVICE_RECOVERY_NATIVE_BOOT_REQUIRED', expected: 'SERVICE_RECOVERY_JOB_UNVERIFIED', recover: true },
+    { inspectReason: 'SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED', expected: 'SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED', recover: false },
+    { inspectReason: 'SERVICE_OWNER_MISMATCH', expected: 'SERVICE_OWNER_MISMATCH', recover: false },
+  ])('15b. Missing managed ledger: $inspectReason never releases writer', async ({ inspectReason, expected, recover }) => {
     const f = await fixture(10_000);
     const workspaceId = 'workspace-1';
     const clientId = 'client-1';
@@ -890,23 +910,25 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
     const taskId = randomUUID();
     const digest = createHash('sha256').update(taskId).digest('hex');
     const binding: NativeAttemptBinding = {
-      taskId, reservationId: taskId, attemptId: randomUUID(), generation: 1, requestDigest: digest,
+      taskId, reservationId: 'managed-writer-' + randomUUID(), attemptId: randomUUID(), generation: 1, requestDigest: digest,
       ownerClientId: clientId, ownerSessionId: 'session-1', workspaceId,
     };
     await mkdir(path.join(f.taskDirectory, taskId), { recursive: true });
     await (f.store as unknown as { activeIndex: { reserve: (input: unknown) => Promise<unknown> } }).activeIndex.reserve({
-      taskId, capacityClass: 'managed_writer', requestDigest: digest, mutationKind: 'opaque_contained_process',
+      taskId: binding.reservationId, capacityClass: 'managed_writer', requestDigest: digest, mutationKind: 'opaque_contained_process',
       nativeBinding: binding, nativeReceiptPath: path.join(f.taskDirectory, taskId, 'containment.receipt.json'),
       ownerClientId: clientId, ownerWorkspaceId: workspaceId,
     });
-    f.mock.setAttemptLost(true);
+    f.mock.setAttemptLost(true, inspectReason);
     f.mock.setRecoveryJobActive(true);
     f.advanceTime(35_000);
     const recovered = await f.lease.acquire(workspaceId, clientId, 'session-2', 60, true);
     expect(recovered.ok).toBe(false);
     if (!recovered.ok) expect(recovered.error.details).toMatchObject({
-      blocker_state: 'unknown', native_reason: 'SERVICE_RECOVERY_JOB_UNVERIFIED',
+      blocker_state: 'unknown', native_reason: expected,
     });
+    expect(f.mock.getAbortCalls()).toBe(0);
+    expect(f.mock.getRecoveryRecordedAt() !== undefined).toBe(recover);
   }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
 
   it('16. Crash After Dispatch + Terminal Reconciled: recovers cleanly once kernel confirms termination', async () => {

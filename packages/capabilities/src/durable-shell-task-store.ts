@@ -951,15 +951,16 @@ export class DurableShellTaskStore {
       const deadlinePassed = typeof metadata.deadline_at === 'string' && Date.now() > new Date(metadata.deadline_at).getTime();
       const isUnverifiedState = metadata.state === 'termination_unverified';
       if (metadata.state !== 'starting' && (isUnverifiedState || deadlinePassed) && await this.nativeOwnerProvenGone(metadata)) {
-        const abortProof = await authority.abortBeforeLaunch({ directory: this.taskDirectory(metadata.task_id), binding });
-        if (abortProof.state === 'launch_not_started' || abortProof.state === 'terminal_verified') {
-          proof = abortProof;
+        // A missing ledger may represent a dispatched process. Only an explicitly
+        // prepared attempt is eligible for a no-dispatch abort.
+        if (proof.reason === 'NATIVE_SERVICE_ATTEMPT_NOT_DISPATCHED') {
+          proof = await authority.abortBeforeLaunch({ directory: this.taskDirectory(metadata.task_id), binding });
         }
-        // A newer OS boot is independent proof that the original local worker and every
-        // pre-boot descendant are gone. The authenticated service still has to accept the
-        // exact attempt, marker timestamp, owner and absent attempt-named Job; a refusal
-        // stays fail-closed. This closes the persisted termination-unknown dead end.
-        if (proof.state === 'termination_unknown' && isIsoUtcTimestamp(metadata.started_at)) {
+        // Preserve owner/identity refusals; only explicit missing or restart
+        // evidence enters the existing native reboot reconciliation path.
+        if (proof.state === 'termination_unknown'
+          && (proof.reason === 'SERVICE_ATTEMPT_NOT_FOUND' || proof.reason === 'SERVICE_RESTART_LAUNCH_UNVERIFIED')
+          && isIsoUtcTimestamp(metadata.started_at)) {
           const recovered = await authority.recoverAfterReboot({
             directory: this.taskDirectory(metadata.task_id), binding, recordedAt: metadata.started_at,
           });

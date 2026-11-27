@@ -772,6 +772,9 @@ internal sealed class ServiceAttemptLedger
                 return Observe(witness) with { Phase = ServiceAttemptPhase.TerminationUnknown,
                     Reason = "SERVICE_RECOVERY_NATIVE_BOOT_REQUIRED" };
             }
+            // Missing non-managed attempt is not owner mismatch or proof of no dispatch.
+            if (!attempts.ContainsKey(identity.AttemptId))
+                throw new IOException("SERVICE_ATTEMPT_NOT_FOUND");
             var entry = Require(identity, callerSid);
             // A crash after the independent terminal write but before the main
             // ledger commit can be recovered without inventing an exit code.

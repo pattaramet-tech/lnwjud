@@ -1287,6 +1287,8 @@ internal static class NativeTests
             var bootTime = now.AddHours(-1);
             var absentJob = new ContainedProcess.JobProbeResult(ContainedProcess.JobProbeStatus.NotFound, 0, 0);
             var activeJob = new ContainedProcess.JobProbeResult(ContainedProcess.JobProbeStatus.Active, 1, 0);
+            ExpectFailure<IOException>(() => ledger.Inspect(request.Identity, request.AuthenticatedCallerSid),
+                "SERVICE_ATTEMPT_NOT_FOUND");
             ExpectFailure<IOException>(() => ledger.RecoverAfterReboot(request.Identity,
                 request.AuthenticatedCallerSid, now, bootTime, absentJob), "SERVICE_RECOVERY_NEW_BOOT_REQUIRED");
             ExpectFailure<IOException>(() => ledger.RecoverAfterReboot(request.Identity,
