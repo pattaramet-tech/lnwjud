@@ -283,7 +283,17 @@ internal sealed class ServiceAttemptLedger
     private void WriteManagedWitness(Entry entry)
     {
         if (persistence is null) throw new IOException("SERVICE_WRITER_WITNESS_UNAVAILABLE");
-        persistence.ManagedWriterWitness(entry.Request.Identity.AttemptId).Save([Snapshot(entry)]);
+        try
+        {
+            persistence.ManagedWriterWitness(entry.Request.Identity.AttemptId).Save([Snapshot(entry)]);
+        }
+        catch (Exception exception)
+        {
+            // A partial witness commit must not permit subsequent admission
+            // using stale in-memory state. Restart must reconcile both stores.
+            unavailable = true;
+            throw new IOException("SERVICE_WRITER_WITNESS_UNAVAILABLE", exception);
+        }
     }
 
     private static bool IsVerifiedWitness(Entry witness) =>

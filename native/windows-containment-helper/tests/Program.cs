@@ -841,6 +841,11 @@ internal static class NativeTests
             File.Delete(ledgerPath);
             ledger = new ServiceAttemptLedger(persistence) { BootIdentityForTest = () => oldBoot };
             var now = DateTimeOffset.UtcNow;
+            var restored = ledger.Inspect(runnable.Identity, runnable.AuthenticatedCallerSid);
+            if (!restored.ReservationHeld || restored.Phase != ServiceAttemptPhase.TerminationUnknown)
+                throw new Exception("Lost ledger bypassed unresolved native admission");
+            var exclusive = NewServiceAttemptRequest(Guid.NewGuid().ToString("D"), ServiceAttemptLedger.GlobalReservationKey);
+            ExpectFailure<IOException>(() => ledger.Prepare(exclusive), "WRITER_RESERVATION_BUSY");
             var absentJob = ContainedProcess.QueryJob(ContainedProcess.GetJobName(runnable.Identity.AttemptId));
             ExpectFailure<IOException>(() => ledger.RecoverAfterReboot(runnable.Identity, runnable.AuthenticatedCallerSid,
                 now.AddDays(-1), now, absentJob), "SERVICE_RECOVERY_NEW_BOOT_REQUIRED");
