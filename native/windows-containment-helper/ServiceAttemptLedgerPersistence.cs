@@ -23,7 +23,8 @@ internal sealed record ServiceAttemptLedgerDocument(int SchemaVersion, Persisted
 /// </summary>
 internal sealed class ServiceAttemptLedgerPersistence
 {
-    private const int SchemaVersion = 2;
+    private const int LegacySchemaVersion = 2;
+    private const int WitnessSchemaVersion = 3;
     private const int MaximumStoreBytes = 32 * 1024 * 1024;
     private const int MaximumAttempts = 100_000;
     private static readonly JsonSerializerOptions Json = new()
@@ -84,7 +85,8 @@ internal sealed class ServiceAttemptLedgerPersistence
             stream.CopyTo(memory);
             var document = JsonSerializer.Deserialize<ServiceAttemptLedgerDocument>(memory.ToArray(), Json)
                 ?? throw new InvalidDataException("ATTEMPT_STORE_EMPTY");
-            if (document.SchemaVersion is not (1 or SchemaVersion) || document.Attempts is null || document.Attempts.Length > MaximumAttempts
+            if (document.SchemaVersion is not (1 or LegacySchemaVersion or WitnessSchemaVersion)
+                || document.Attempts is null || document.Attempts.Length > MaximumAttempts
                 || document.SchemaVersion == 1 && document.Attempts.Any(attempt => attempt.Request.RegistryOnly))
                 throw new InvalidDataException("ATTEMPT_STORE_SCHEMA_INVALID");
             return document.Attempts;
@@ -95,11 +97,14 @@ internal sealed class ServiceAttemptLedgerPersistence
         }
     }
 
-    internal void Save(IReadOnlyCollection<PersistedServiceAttempt> attempts)
+    internal void Save(IReadOnlyCollection<PersistedServiceAttempt> attempts, bool requireWitnessSchema = false)
     {
         if (attempts.Count > MaximumAttempts) throw new IOException("ATTEMPT_HISTORY_LIMIT");
         EnsureNoReparsePoints(filename);
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(new ServiceAttemptLedgerDocument(SchemaVersion, attempts.ToArray()), Json);
+        // Never advertise a new phase or field under the legacy schema number.
+        var schema = requireWitnessSchema || attempts.Any(attempt => attempt.Phase == ServiceAttemptPhase.AdmissionRegistered
+            || attempt.Request.NativeDispatchBootId is not null) ? WitnessSchemaVersion : LegacySchemaVersion;
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(new ServiceAttemptLedgerDocument(schema, attempts.ToArray()), Json);
         if (bytes.Length > MaximumStoreBytes) throw new IOException("ATTEMPT_STORE_SIZE_LIMIT");
         var temporary = filename + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try

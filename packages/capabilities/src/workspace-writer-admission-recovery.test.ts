@@ -25,6 +25,7 @@ interface MockAuthorityContext {
   readonly getCancelledAttempts: () => readonly string[];
   readonly getRecoveryRecordedAt: () => string | undefined;
   readonly getAbortCalls: () => number;
+  readonly loseAfterNextNoLaunchInspect: () => void;
 }
 
 function createMockAuthority(root: string): MockAuthorityContext {
@@ -36,6 +37,7 @@ function createMockAuthority(root: string): MockAuthorityContext {
   let attemptLost = false;
   let missingReason = 'SERVICE_ATTEMPT_NOT_FOUND';
   let abortCalls = 0;
+  let loseAfterNoLaunchInspect = false;
   let restartUnknown = false;
   let recoveryJobActive = false;
   let recoveryRecordedAt: string | undefined;
@@ -95,6 +97,10 @@ function createMockAuthority(root: string): MockAuthorityContext {
         if (currentPhase === 5) {
           return { identity: request.identity, phase: 5, reason: currentReason ?? 'unverified', reservationHeld: true } as T;
         }
+        if (loseAfterNoLaunchInspect) {
+          loseAfterNoLaunchInspect = false;
+          attemptLost = true;
+        }
         return { identity: request.identity, phase: 2, reservationHeld: false } as T;
       }
       return { identity: request.identity, phase: currentPhase } as T;
@@ -132,6 +138,7 @@ function createMockAuthority(root: string): MockAuthorityContext {
     getCancelledAttempts: () => [...cancelled],
     getRecoveryRecordedAt: () => recoveryRecordedAt,
     getAbortCalls: () => abortCalls,
+    loseAfterNextNoLaunchInspect: () => { loseAfterNoLaunchInspect = true; },
   };
 }
 
@@ -997,6 +1004,31 @@ describe('Mandatory Regression Suite: Writer Admission & Task Recovery Lifecycle
     if (!inspected.ok) return;
     expect(inspected.value.state).toBe('active');
     expect(inspected.value.generation).toBe(2);
+  }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
+
+  it('19. Lost native receipt during terminal verification never creates an abort tombstone', async () => {
+    const f = await fixture(10_000);
+    const workspaceId = 'workspace-1';
+    const clientId = 'client-1';
+    const sessionId = 'session-1';
+    const taskId = randomUUID();
+    const digest = createHash('sha256').update(taskId).digest('hex');
+    const binding = durableShellNativeBinding({
+      taskId, executable: 'node.exe', arguments: ['-e', '1'], cwd: f.root,
+      timeoutSeconds: 30, maxOutputBytes: 1024, includeStdout: true, includeStderr: true,
+      owner: { clientId, sessionId, workspaceId },
+    }, digest);
+    const taskDir = path.join(f.taskDirectory, taskId);
+    await mkdir(taskDir, { recursive: true });
+    const metadata = makeCanonicalMetadata({
+      taskId, clientId, sessionId, workspaceId, state: 'failed', binding, exitCode: -1,
+    });
+    await writeFile(path.join(taskDir, 'task.json'), JSON.stringify(metadata));
+    f.mock.setPhase(2);
+    f.mock.loseAfterNextNoLaunchInspect();
+    f.mock.setRecoveryJobActive(true);
+    await expect(f.store.inspectForWriterAdmission(taskId)).resolves.toBe('unknown');
+    expect(f.mock.getAbortCalls()).toBe(0);
   }, WINDOWS_WRITER_IO_TEST_TIMEOUT_MS);
 
   it('18. Persisted termination-unknown durable shell task reconciles only through verified new-boot proof', async () => {

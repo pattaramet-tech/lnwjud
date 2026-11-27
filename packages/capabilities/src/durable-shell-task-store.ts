@@ -771,11 +771,9 @@ export class DurableShellTaskStore {
       || !nativeBindingMatchesMetadata(canonical.value, binding)) return false;
     const authority = this.authorityFor(canonical.value);
     if (authority === undefined) return false;
-    let proof = await authority.inspect({ directory: this.taskDirectory(reservation.taskId), binding });
-    if (proof.state === 'termination_unknown' && canonical.value.state === 'failed' && canonical.value.exit_code === -1) {
-      const abortProof = await authority.abortBeforeLaunch({ directory: this.taskDirectory(reservation.taskId), binding });
-      if (abortProof.state === 'launch_not_started' || abortProof.state === 'terminal_verified') proof = abortProof;
-    }
+    // Verification is read-only. Host terminal metadata cannot authorize a new
+    // abort tombstone if the native receipt disappears between observations.
+    const proof = await authority.inspect({ directory: this.taskDirectory(reservation.taskId), binding });
     if (proof.state === 'launch_not_started') return canonical.value.state === 'failed' && canonical.value.exit_code === -1;
     return proof.state === 'terminal_verified' && canonical.value.state === nativeOutcomeState(proof.outcome, proof.exitCode)
       && canonical.value.exit_code === proof.exitCode && typeof canonical.value.finished_at === 'string';

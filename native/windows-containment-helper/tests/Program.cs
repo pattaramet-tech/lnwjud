@@ -337,6 +337,7 @@ internal static class NativeTests
             Console.WriteLine("PASS absent Windows service is detected without waiting for the native RPC deadline");
             TestServiceAttemptLedger();
             TestManagedWriterRegistration();
+            TestManagedWriterCollisionWitness();
             Console.WriteLine("PASS service attempt ownership, reservation, and terminal release lifecycle");
             TestLaunchTokenFailureBeforeDispatch();
             Console.WriteLine("PASS token setup failure releases only a proved never-started native attempt");
@@ -786,6 +787,75 @@ internal static class NativeTests
             throw new Exception("Released tombstone allowed prepare replay or reacquired its reservation");
     }
 
+    // Mirror the FIX-07 request/document shape and strict reader contract.
+    private sealed record LegacyAttemptRequest(ServiceAttemptIdentity Identity, string AuthenticatedCallerSid,
+        string ReservationKey, string OperationDigest, bool Shared, bool HoldForImport,
+        bool CancellationRequested, bool PublicationCommitted, bool RegistryOnly);
+    private sealed record LegacyAttempt(LegacyAttemptRequest Request, int Phase, int? TargetPid,
+        int? Outcome, int? ExitCode, int? ActiveProcesses, string? Reason, bool ReservationHeld);
+    private sealed record LegacyLedger(int SchemaVersion, LegacyAttempt[] Attempts);
+
+    private static void AssertRollbackSchema(string filename, int expectedSchema)
+    {
+        var bytes = File.ReadAllBytes(filename);
+        using var json = JsonDocument.Parse(bytes);
+        if (json.RootElement.GetProperty("schemaVersion").GetInt32() != expectedSchema)
+            throw new Exception("Unexpected rollback schema fence");
+        if (expectedSchema == 2)
+        {
+            var legacy = JsonSerializer.Deserialize<LegacyLedger>(bytes, new JsonSerializerOptions {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow,
+            }) ?? throw new Exception("Legacy ledger was empty");
+            if (legacy.Attempts.Any(attempt => attempt.Phase is < 0 or > 5))
+                throw new Exception("New phase escaped into legacy ledger");
+        }
+    }
+
+    private static void TestManagedWriterCollisionWitness()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "lnwjud-managed-collision-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var store = Path.Combine(directory, "attempts.json");
+            var persistence = new ServiceAttemptLedgerPersistence(store);
+            var ledger = new ServiceAttemptLedger(persistence);
+            var sid = WindowsIdentity.GetCurrent().User!.Value;
+            var request = NewServiceAttemptRequest(Guid.NewGuid().ToString("D"), ServiceAttemptLedger.GlobalReservationKey)
+                with { Shared = true, AuthenticatedCallerSid = sid };
+            request = request with { Identity = request.Identity with { ReservationId = "managed-writer-" + Guid.NewGuid().ToString("D") } };
+            request = request with { Identity = ledger.RegisterManagedWriter(request.Identity, sid).Identity };
+            ledger.Prepare(request);
+            var jobName = ContainedProcess.GetJobName(request.Identity.AttemptId);
+            using var foreign = ContainedProcess.Start(Executable, ["sleep", "30000"], Environment.CurrentDirectory,
+                false, EnvironmentBlock, jobName: jobName);
+            try
+            {
+                var marker = Path.Combine(directory, "unexpected-target");
+                var operation = new ServiceProcessOperation("run_process", Executable, ["mark", marker],
+                    Environment.CurrentDirectory, 10_000, false, EnvironmentBlock, 1024);
+                var runtime = new WindowsServiceProcessRuntime(ledger, useCurrentUserTestLauncher: true);
+                var result = runtime.Run(request.Identity, sid, request.OperationDigest, operation, 0);
+                if (result.Phase != ServiceAttemptPhase.LaunchNotStarted || result.ReservationHeld
+                    || result.Reason != "CONTAINMENT_JOB_NAME_IN_USE" || foreign.ActiveProcesses == 0 || File.Exists(marker))
+                    throw new Exception("Managed collision did not preserve foreign Job and exact no-launch proof");
+                AssertRollbackSchema(store, 2);
+                var witness = persistence.ManagedWriterWitness(request.Identity.AttemptId).Load().Single();
+                if (witness.Phase != ServiceAttemptPhase.LaunchNotStarted || witness.ReservationHeld
+                    || witness.Reason != result.Reason || witness.Request.NativeDispatchBootId is null)
+                    throw new Exception("Collision proof was not independently durable");
+                File.Delete(store); // disposable ledger-loss fixture only
+                var restored = new ServiceAttemptLedger(persistence).Inspect(request.Identity, sid);
+                if (restored != result || foreign.ActiveProcesses == 0 || File.Exists(marker))
+                    throw new Exception("Collision witness did not restore exactly while foreign Job remained active");
+                AssertRollbackSchema(store, 2);
+            }
+            finally { foreign.Cancel(); }
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
     private static void TestManagedWriterRegistration()
     {
         var directory = Path.Combine(Path.GetTempPath(), "lnwjud-writer-registration-" + Guid.NewGuid().ToString("N"));
@@ -804,6 +874,7 @@ internal static class NativeTests
             request = request with { Identity = registration.Identity };
             if (registration.Phase != ServiceAttemptPhase.AdmissionRegistered || registration.ReservationHeld)
                 throw new Exception("Registration must not hold native capacity or dispatch");
+            AssertRollbackSchema(ledgerPath, 3);
             ledger = new ServiceAttemptLedger(persistence);
             if (ledger.Inspect(request.Identity, request.AuthenticatedCallerSid) != registration)
                 throw new Exception("Registration was not durable before marker publication");
@@ -817,6 +888,7 @@ internal static class NativeTests
             var abort = ledger.AbortBeforeLaunch(request with { OperationDigest = request.Identity.RequestDigest });
             if (abort.Phase != ServiceAttemptPhase.LaunchNotStarted || abort.ReservationHeld)
                 throw new Exception("Registered intent was not durably fenced");
+            AssertRollbackSchema(ledgerPath, 2);
             ledger = new ServiceAttemptLedger(persistence);
             if (ledger.Inspect(request.Identity, request.AuthenticatedCallerSid) != abort)
                 throw new Exception("Abort tombstone was not durable");
@@ -835,6 +907,7 @@ internal static class NativeTests
             if (prepared.Phase != ServiceAttemptPhase.Prepared || !prepared.ReservationHeld
                 || !ledger.TryCommitDispatch(runnable.Identity, runnable.AuthenticatedCallerSid, runnable.OperationDigest))
                 throw new Exception("Exact registered binding did not promote to dispatch");
+            AssertRollbackSchema(ledgerPath, 3);
             var dispatched = ledger.AbortBeforeLaunch(runnable);
             if (dispatched.Phase != ServiceAttemptPhase.DispatchCommitted || !dispatched.ReservationHeld)
                 throw new Exception("Committed dispatch was released by abort");
@@ -857,6 +930,7 @@ internal static class NativeTests
             if (recovered.Phase != ServiceAttemptPhase.TerminalVerified || recovered.Outcome != ServiceProcessOutcome.Interrupted
                 || recovered.ExitCode != 125 || recovered.ReservationHeld)
                 throw new Exception("New boot with exact witness did not verify interrupted termination");
+            AssertRollbackSchema(ledgerPath, 2);
             if (ledger.RecoverAfterReboot(runnable.Identity, runnable.AuthenticatedCallerSid,
                 now.AddDays(-1), now, absentJob) != recovered)
                 throw new Exception("Missing ledger recovery was not idempotent");

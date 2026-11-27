@@ -63,6 +63,7 @@ internal sealed record ServiceAttemptRequest(
     bool CancellationRequested = false,
     bool PublicationCommitted = false,
     bool RegistryOnly = false,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     Guid? NativeDispatchBootId = null);
 
 internal sealed class ServiceAttemptLedger
@@ -179,7 +180,7 @@ internal sealed class ServiceAttemptLedger
             {
                 // An unexpected live or inaccessible job is not a terminal
                 // observation. Refuse service startup rather than drop a hold.
-                RequireAbsentJob(witness.Request.Identity);
+                VerifyRestoredWitnessJob(witness);
             }
             if (witness.Request.HoldForImport) witness.ReservationHeld = true;
             attempts.Add(witness.Request.Identity.AttemptId, witness);
@@ -306,10 +307,22 @@ internal sealed class ServiceAttemptLedger
             throw new IOException("SERVICE_RECOVERY_JOB_UNVERIFIED");
     }
 
+    private static void VerifyRestoredWitnessJob(Entry witness)
+    {
+        // Only a protected, exact-attempt collision tombstone records that the
+        // existing named Job belonged to another launch. No target was created.
+        // Never query, stop or adopt that foreign Job as our own terminal proof.
+        if (witness.Phase == ServiceAttemptPhase.LaunchNotStarted
+            && witness.Reason == "CONTAINMENT_JOB_NAME_IN_USE"
+            && witness.TargetPid is null && witness.Request.NativeDispatchBootId is not null)
+            return;
+        RequireAbsentJob(witness.Request.Identity);
+    }
+
     private ServiceAttemptObservation RestoreVerifiedWitness(Entry witness)
     {
         if (!IsVerifiedWitness(witness)) throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
-        RequireAbsentJob(witness.Request.Identity);
+        VerifyRestoredWitnessJob(witness);
         witness.ReservationHeld = false;
         attempts[witness.Request.Identity.AttemptId] = witness;
         Persist();
@@ -563,6 +576,16 @@ internal sealed class ServiceAttemptLedger
                 || entry.Phase is not (ServiceAttemptPhase.DispatchCommitted or ServiceAttemptPhase.TerminationUnknown)
                 || entry.TargetPid is not null || !entry.ReservationHeld)
                 throw new IOException("ATTEMPT_PHASE_CONFLICT");
+            if (IsManagedWriter(identity))
+            {
+                var witness = ReadManagedWitness(identity, callerSid);
+                if (witness?.Phase != ServiceAttemptPhase.DispatchCommitted
+                    || witness.Request.NativeDispatchBootId is null)
+                    throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
+                var collision = new Entry(entry.Request) { Phase = ServiceAttemptPhase.LaunchNotStarted,
+                    Reason = "CONTAINMENT_JOB_NAME_IN_USE", ReservationHeld = entry.Request.HoldForImport };
+                WriteManagedWitness(collision); // consume native proof, then durable tombstone before main release
+            }
             entry.Phase = ServiceAttemptPhase.LaunchNotStarted;
             entry.Reason = "CONTAINMENT_JOB_NAME_IN_USE";
             entry.ReservationHeld = entry.Request.HoldForImport;
@@ -609,7 +632,9 @@ internal sealed class ServiceAttemptLedger
             {
                 // Record only actual native zero-active termination. Never
                 // clear an import hold via this independent receipt.
-                var terminalWitness = new Entry(entry.Request) { Phase = ServiceAttemptPhase.TerminalVerified,
+                var terminalRequest = outcome is ServiceProcessOutcome.Cancelled or ServiceProcessOutcome.TimedOut
+                    ? entry.Request with { CancellationRequested = true } : entry.Request;
+                var terminalWitness = new Entry(terminalRequest) { Phase = ServiceAttemptPhase.TerminalVerified,
                     TargetPid = entry.TargetPid, Outcome = outcome, ExitCode = exitCode,
                     ActiveProcesses = 0, ReservationHeld = entry.Request.HoldForImport };
                 if (persistence is not null) WriteManagedWitness(terminalWitness);
@@ -738,7 +763,8 @@ internal sealed class ServiceAttemptLedger
                     var witness = ReadManagedWitness(identity, callerSid)
                         ?? throw new IOException("SERVICE_RECOVERY_NATIVE_BINDING_REQUIRED");
                     witness.Request = witness.Request with { HoldForImport = false };
-                    if (witness.Phase == ServiceAttemptPhase.TerminalVerified) witness.ReservationHeld = false;
+                    if (witness.Phase is ServiceAttemptPhase.TerminalVerified or ServiceAttemptPhase.LaunchNotStarted)
+                        witness.ReservationHeld = false;
                     WriteManagedWitness(witness);
                 }
 #if NATIVE_CONTAINMENT_TESTS
@@ -936,19 +962,24 @@ internal sealed class ServiceAttemptLedger
         if (persistence is null) return;
         try
         {
+            // FIX-07 can read schema 2, but not phase 6 or the boot GUID.
+            // Keep a version-3 fence whenever a managed intent/hold remains.
+            // At a fully settled managed boundary, the main ledger can retain
+            // the exact legacy terminal rows; boot evidence stays in witnesses.
+            var requiresNewFormat = attempts.Values.Any(entry => IsManagedWriter(entry.Request.Identity)
+                && (entry.ReservationHeld || entry.Request.HoldForImport
+                    || entry.Phase is not (ServiceAttemptPhase.LaunchNotStarted or ServiceAttemptPhase.TerminalVerified)));
             var snapshot = attempts.Values
                 .OrderBy(entry => entry.Request.Identity.AttemptId, StringComparer.Ordinal)
-                .Select(entry => new PersistedServiceAttempt(
-                    entry.Request,
-                    entry.Phase,
-                    entry.TargetPid,
-                    entry.Outcome,
-                    entry.ExitCode,
-                    entry.ActiveProcesses,
-                    entry.Reason,
-                    entry.ReservationHeld))
+                .Select(entry =>
+                {
+                    var stored = Snapshot(entry);
+                    return !requiresNewFormat && IsManagedWriter(entry.Request.Identity)
+                        ? stored with { Request = stored.Request with { NativeDispatchBootId = null } }
+                        : stored;
+                })
                 .ToArray();
-            persistence.Save(snapshot);
+            persistence.Save(snapshot, requiresNewFormat);
         }
         catch (Exception exception)
         {
