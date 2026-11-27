@@ -6,6 +6,7 @@ on:
       - main
       - dev
       - 'release/v*'
+      - 'fix/native-missing-attempt-recovery'
   pull_request:
     branches: [ main, dev ]
   workflow_dispatch:
