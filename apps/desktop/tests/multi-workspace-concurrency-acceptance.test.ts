@@ -145,7 +145,7 @@ describe('multi-workspace concurrency acceptance', () => {
 
       const lease = await workspaceLeases.acquire(workspaceA.id, writerId, writerSession, 120);
       if (!lease.ok) throw new Error(lease.error.message);
-      releaseWriterLease = () => workspaceLeases.release(workspaceA.id, writerId, writerSession, lease.value);
+      releaseWriterLease = (): Promise<unknown> => workspaceLeases.release(workspaceA.id, writerId, writerSession, lease.value);
       const admission = new SharedManagedWriterAdmission(path.join(dataRoot, 'background-tasks'));
       const reservation = await admission.enter({
         actorClientId: writerId, actorSessionId: writerSession, workspaceId: workspaceA.id, kind: 'synchronous_mutation',
