@@ -1,0 +1,60 @@
+name: FIX-08 R10 Isolated Rollback Qualification
+on:
+  push:
+    branches:
+      - test/fix08-r10-rollback
+permissions:
+  contents: read
+  actions: read
+jobs:
+  isolated-rollback:
+    if: github.repository == 'pattaramet-tech/lnwjud' && github.ref == 'refs/heads/test/fix08-r10-rollback'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [settled, registered, active]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Download exact pinned installer archives
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:GITHUB_ACTIONS -ne 'true') { throw 'HOSTED_RUNNER_REQUIRED' }
+          $root = Join-Path $env:RUNNER_TEMP 'fix08-r10'
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          $packages = @(
+            @{ Name='fix07'; Id='15191259372'; Run='45985876105'; Head='a5f471b90f9b7d0cfcf81a6139eb7371f37381f7'; Archive='4f5262ba777c28b7318dbbb6f5331a6a083873d9619503b260e237c762fcc92b'; Setup='98cfb7579ab43da72beb31681f2ae9d919d0965d819f07eed078d05ed6d8dac5' },
+            @{ Name='fix08'; Id='15220143543'; Run='46041108282'; Head='8c2398639f98fbda1302f7550fe9f7cfcce347b0'; Archive='a4d944c405e9741f4e79df26b14e370e057f22de48cb2d48010face89e105521'; Setup='80cadbe4cfe1d9e96790cbefef9922846d946c8447752b101a02d191fee60429' }
+          )
+          foreach ($p in $packages) {
+            $zip = Join-Path $root ($p.Name + '.zip')
+            $dest = Join-Path $root $p.Name
+            $url = "https://api.github.com/repos/pattaramet-tech/lnwjud/actions/artifacts/$($p.Id)/zip"
+            Invoke-WebRequest -Uri $url -Headers @{ Authorization="Bearer $env:GH_TOKEN"; Accept='application/vnd.github+json'; 'X-GitHub-Api-Version'='2022-11-28' } -OutFile $zip
+            if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne $p.Archive) { throw "ARCHIVE_MISMATCH_$($p.Name)" }
+            Expand-Archive -LiteralPath $zip -DestinationPath $dest
+            $prov = Get-Content -LiteralPath (Join-Path $dest 'PROVENANCE.json') -Raw | ConvertFrom-Json
+            $setup = Join-Path $dest 'lnwjud-Setup-5.9.6.exe'
+            if ($prov.source.commit -cne $p.Head -or $prov.build.runId -cne $p.Run -or (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant() -cne $p.Setup) { throw "PROVENANCE_MISMATCH_$($p.Name)" }
+            Write-Output "VERIFIED $($p.Name) $($p.Head) $($p.Setup)"
+          }
+      - name: Run production installer and native RPC qualification
+        shell: pwsh
+        env:
+          FIX08_R10_SCENARIO: ${{ matrix.scenario }}
+        run: node scripts/qualification/fix08-r10-rollback.cjs
+      - name: Upload qualification report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fix08-r10-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/fix08-r10/report.json
+          if-no-files-found: warn
+          retention-days: 7
