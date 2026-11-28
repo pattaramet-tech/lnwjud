@@ -35,6 +35,49 @@ internal static class WindowsContainmentService
     private static nint statusHandle;
     private static CancellationTokenSource? stopSource;
 
+    // One admission gate covers short RPCs, import publication and long-lived
+    // MCP/update requests. A successful fence survives a service restart via
+    // the protected store, and refuses all subsequent work.
+    internal sealed class RemovalAdmission(bool alreadyFenced)
+    {
+        private readonly object sync = new();
+        private bool frozen = alreadyFenced;
+        private int active;
+        internal IDisposable Enter()
+        {
+            lock (sync)
+            {
+                if (frozen) throw new IOException("SERVICE_REMOVE_ADMISSION_FENCED");
+                active++;
+                return new Lease(this);
+            }
+        }
+        internal void Freeze(Action verify, Action persist)
+        {
+            lock (sync)
+            {
+                if (active != 0) throw new IOException("SERVICE_REMOVE_CALLS_ACTIVE");
+                verify(); // failed checks must not change the admission state
+                try { persist(); }
+                catch { frozen = true; throw; } // uncertain durable fence is fail-closed
+                frozen = true;
+            }
+        }
+        private sealed class Lease(RemovalAdmission owner) : IDisposable
+        {
+            private bool disposed;
+            public void Dispose()
+            {
+                lock (owner.sync)
+                {
+                    if (disposed) return;
+                    disposed = true;
+                    owner.active--;
+                }
+            }
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct ServiceTableEntry
     {
@@ -106,6 +149,7 @@ internal static class WindowsContainmentService
         bool useCurrentUserTestLauncher, bool useCurrentUserTestPipeSecurity = false, UpdateStartupGate? startup = null)
     {
         ArgumentNullException.ThrowIfNull(ledger);
+        var removal = new RemovalAdmission(ledger.HasRemovalFence);
         var runtime = new WindowsServiceProcessRuntime(ledger, useCurrentUserTestLauncher);
         var imports = new ServiceImportTransactionRuntime(ledger, ledger.ImportStoreDirectory, useCurrentUserTestLauncher);
         try
@@ -132,7 +176,7 @@ internal static class WindowsContainmentService
                 try
                 {
                     await pipe.WaitForConnectionAsync(cancellationToken).ConfigureAwait(false);
-                    workers.Add(HandleClientAndDisposeAsync(pipe, ledger, runtime, imports, startup, cancellationToken));
+                    workers.Add(HandleClientAndDisposeAsync(pipe, ledger, runtime, imports, startup, removal, cancellationToken));
                 }
                 catch
                 {
@@ -151,7 +195,7 @@ internal static class WindowsContainmentService
     }
 
     private static async Task HandleClientAndDisposeAsync(NamedPipeServerStream pipe, ServiceAttemptLedger ledger, WindowsServiceProcessRuntime runtime,
-        ServiceImportTransactionRuntime imports, UpdateStartupGate? startup, CancellationToken serviceStopping)
+        ServiceImportTransactionRuntime imports, UpdateStartupGate? startup, RemovalAdmission removal, CancellationToken serviceStopping)
     {
         using (pipe)
         using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(serviceStopping))
@@ -165,7 +209,7 @@ internal static class WindowsContainmentService
                 {
                     request = JsonSerializer.Deserialize<RpcRequest>(requestBytes, Json)
                         ?? throw new IOException("SERVICE_REQUEST_INVALID");
-                    if (request.Command is "update_startup" or "update_opaque" or "update_capabilities")
+                    if (request.Command is "update_startup" or "update_opaque" or "update_capabilities" or "prepare_manual_removal")
                     {
                         using var envelope = JsonDocument.Parse(requestBytes);
                         if (envelope.RootElement.EnumerateObject().Count() != 2)
@@ -178,6 +222,20 @@ internal static class WindowsContainmentService
                 if (request.Command is "update_enroll" or "update_prepare") timeout.CancelAfter(TimeSpan.FromSeconds(180));
 
                 using var caller = AuthenticatedPipeCaller.Capture(pipe);
+                if (request.Command == "prepare_manual_removal")
+                {
+                    // Never accept an asserted administrator flag or caller SID.
+                    using var identity = new WindowsIdentity(caller.PrimaryToken.DangerousGetHandle());
+                    if (!new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
+                        throw new UnauthorizedAccessException("SERVICE_REMOVE_ADMIN_REQUIRED");
+                    // This is the manual NSIS transition, not an enrolled update.
+                    if (startup?.Inspect().Kind != "unmanaged")
+                        throw new IOException("SERVICE_REMOVE_UPDATE_STATE_UNVERIFIED");
+                    removal.Freeze(ledger.AssertRemovalSafe, ledger.FenceRemoval);
+                    await WriteFrameAsync(pipe, new RpcResponse(3, true, new { kind = "manual_removal_fenced" }, null), timeout.Token).ConfigureAwait(false);
+                    return;
+                }
+                using var admission = removal.Enter();
                 if (request.Command == "update_launch")
                 {
                     if (startup is null) throw new IOException("SERVICE_UPDATE_AUTHORITY_UNAVAILABLE");

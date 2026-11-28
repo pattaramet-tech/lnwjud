@@ -338,6 +338,7 @@ internal static class NativeTests
             TestServiceAttemptLedger();
             TestManagedWriterRegistration();
             TestManagedWriterCollisionWitness();
+            TestManualRemovalFence();
             Console.WriteLine("PASS service attempt ownership, reservation, and terminal release lifecycle");
             TestLaunchTokenFailureBeforeDispatch();
             Console.WriteLine("PASS token setup failure releases only a proved never-started native attempt");
@@ -852,6 +853,47 @@ internal static class NativeTests
                 AssertRollbackSchema(store, 2);
             }
             finally { foreign.Cancel(); }
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    private static void TestManualRemovalFence()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "lnwjud-removal-fence-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var store = Path.Combine(directory, "attempts.json");
+            var persistence = new ServiceAttemptLedgerPersistence(store);
+            var ledger = new ServiceAttemptLedger(persistence);
+            var admission = new WindowsContainmentService.RemovalAdmission(ledger.HasRemovalFence);
+            using (admission.Enter())
+                ExpectFailure<IOException>(() => admission.Freeze(ledger.AssertRemovalSafe, ledger.FenceRemoval), "SERVICE_REMOVE_CALLS_ACTIVE");
+            if (ledger.HasRemovalFence) throw new Exception("Active call created removal fence");
+            var request = NewServiceAttemptRequest(Guid.NewGuid().ToString("D"), ServiceAttemptLedger.GlobalReservationKey)
+                with { Shared = true };
+            request = request with { Identity = request.Identity with { ReservationId = "managed-writer-" + Guid.NewGuid().ToString("D") } };
+            request = request with { Identity = ledger.RegisterManagedWriter(request.Identity, request.AuthenticatedCallerSid).Identity };
+            var before = File.ReadAllBytes(store);
+            ExpectFailure<IOException>(() => admission.Freeze(ledger.AssertRemovalSafe, ledger.FenceRemoval), "SERVICE_REMOVE_ATTEMPTS_UNRESOLVED");
+            if (ledger.HasRemovalFence || !File.ReadAllBytes(store).AsSpan().SequenceEqual(before))
+                throw new Exception("Rejected removal mutated the ledger or fence");
+            using (admission.Enter()) { } // rejection must leave normal work admitted
+            ledger.AbortBeforeLaunch(request with { OperationDigest = request.Identity.RequestDigest });
+            var settled = File.ReadAllBytes(store);
+            admission.Freeze(ledger.AssertRemovalSafe, ledger.FenceRemoval);
+            admission.Freeze(ledger.AssertRemovalSafe, ledger.FenceRemoval); // repeated NSIS checks
+            ExpectFailure<IOException>(() => admission.Enter(), "SERVICE_REMOVE_ADMISSION_FENCED");
+            var reopened = new ServiceAttemptLedger(persistence);
+            var afterRestart = new WindowsContainmentService.RemovalAdmission(reopened.HasRemovalFence);
+            ExpectFailure<IOException>(() => afterRestart.Enter(), "SERVICE_REMOVE_ADMISSION_FENCED");
+            if (!File.ReadAllBytes(store).AsSpan().SequenceEqual(settled))
+                throw new Exception("Removal fence changed terminal evidence");
+            // Simulate confirmed SCM deletion in this disposable fixture only.
+            persistence.ClearRemovalFenceAfterServiceDeletion();
+            if (persistence.HasRemovalFence()) throw new Exception("Removal fence survived confirmed deletion");
+            File.Delete(store);
+            ExpectFailure<IOException>(() => ledger.AssertRemovalSafe(), "SERVICE_REMOVE_LEDGER_UNVERIFIED");
         }
         finally { Directory.Delete(directory, true); }
     }

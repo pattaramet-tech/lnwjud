@@ -73,6 +73,22 @@
   ${endIf}
 !macroend
 
+; For unattended updates, refuse at uninstaller initialization before file removal.
+; Interactive removal is checked again in service-uninstall after confirmation.
+!macro customUnInit
+  ${if} $installMode == "all"
+    ${if} ${Silent}
+      nsExec::ExecToStack '"$INSTDIR\resources\native-containment\lnwjud-containment.exe" service-rollback-preflight'
+      Pop $0
+      Pop $1
+      ${if} $0 != 0
+        SetErrorLevel 125
+        Quit
+      ${endif}
+    ${endif}
+  ${endif}
+!macroend
+
 !macro customUnInstall
   ${if} $installMode == "all"
     nsExec::ExecToStack '"$INSTDIR\resources\native-containment\lnwjud-containment.exe" service-uninstall'

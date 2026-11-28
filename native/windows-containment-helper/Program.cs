@@ -51,6 +51,7 @@ internal static class Program
             if (args.Length == 1 && args[0] == "service") { WindowsContainmentService.Run(); return 0; }
             if (args.Length == 1 && args[0] == "service-install") { WindowsContainmentServiceInstaller.Install(); return 0; }
             if (args.Length == 1 && args[0] == "service-uninstall") { WindowsContainmentServiceInstaller.Uninstall(); return 0; }
+            if (args.Length == 1 && args[0] == "service-rollback-preflight") { WindowsContainmentServiceInstaller.PrepareManualRemoval(); return 0; }
 #endif
 #if NATIVE_CONTAINMENT_TESTS
             if (args.Length != 1 || args[0] != "run-v2") throw new IOException("HELPER_COMMAND_INVALID");
@@ -83,7 +84,7 @@ internal static class Program
                 try { Console.WriteLine(rpcFailure); }
                 catch { }
             }
-            if (args.Length == 1 && (args[0] == "service-install" || args[0] == "service-uninstall"))
+            if (args.Length == 1 && (args[0] == "service-install" || args[0] == "service-uninstall" || args[0] == "service-rollback-preflight"))
             {
                 try { Console.WriteLine(ServiceFailureReason(failure, args[0] == "service-install")); }
                 catch { /* Preserve the nonzero failure when stdout is unavailable. */ }

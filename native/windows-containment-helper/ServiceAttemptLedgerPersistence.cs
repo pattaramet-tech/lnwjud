@@ -72,10 +72,17 @@ internal sealed class ServiceAttemptLedgerPersistence
         EnsureNoReparsePoints(this.filename);
     }
 
-    internal PersistedServiceAttempt[] Load()
+    internal PersistedServiceAttempt[] Load(bool requireLegacySchema = false)
     {
         EnsureNoReparsePoints(filename);
-        if (!File.Exists(filename)) return [];
+        if (requireLegacySchema)
+        {
+            // File.Exists suppresses access errors. An unverifiable store is
+            // not an empty store when authorizing a destructive transition.
+            try { _ = File.GetAttributes(filename); }
+            catch (FileNotFoundException) { return []; }
+        }
+        else if (!File.Exists(filename)) return [];
 
         try
         {
@@ -86,6 +93,7 @@ internal sealed class ServiceAttemptLedgerPersistence
             var document = JsonSerializer.Deserialize<ServiceAttemptLedgerDocument>(memory.ToArray(), Json)
                 ?? throw new InvalidDataException("ATTEMPT_STORE_EMPTY");
             if (document.SchemaVersion is not (1 or LegacySchemaVersion or WitnessSchemaVersion)
+                || requireLegacySchema && document.SchemaVersion == WitnessSchemaVersion
                 || document.Attempts is null || document.Attempts.Length > MaximumAttempts
                 || document.SchemaVersion == 1 && document.Attempts.Any(attempt => attempt.Request.RegistryOnly))
                 throw new InvalidDataException("ATTEMPT_STORE_SCHEMA_INVALID");
@@ -122,6 +130,58 @@ internal sealed class ServiceAttemptLedgerPersistence
         {
             if (File.Exists(temporary)) File.Delete(temporary);
         }
+    }
+
+    // This marker is service-owned and deliberately survives a service crash.
+    // It is not a terminal receipt and must never authorize reservation release.
+    private string RemovalFencePath => Path.Combine(Path.GetDirectoryName(filename)!, "manual-removal-fence-v1");
+    private static readonly byte[] RemovalFenceBytes = System.Text.Encoding.UTF8.GetBytes("lnwjud-manual-removal-v1\n");
+
+    internal bool HasRemovalFence()
+    {
+        var target = RemovalFencePath;
+        EnsureNoReparsePoints(target);
+        try
+        {
+            using var input = new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (input.Length != RemovalFenceBytes.Length)
+                throw new IOException("SERVICE_REMOVE_FENCE_UNVERIFIED");
+            var actual = new byte[RemovalFenceBytes.Length];
+            input.ReadExactly(actual);
+            if (!actual.AsSpan().SequenceEqual(RemovalFenceBytes))
+                throw new IOException("SERVICE_REMOVE_FENCE_UNVERIFIED");
+            return true;
+        }
+        catch (FileNotFoundException) { return false; }
+    }
+
+    internal void FenceRemoval()
+    {
+        if (HasRemovalFence()) return;
+        var target = RemovalFencePath;
+        var temporary = target + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
+            {
+                stream.Write(RemovalFenceBytes);
+                stream.Flush(true);
+            }
+            File.Move(temporary, target, false);
+            if (!HasRemovalFence()) throw new IOException("SERVICE_REMOVE_FENCE_UNVERIFIED");
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
+    }
+
+    // Only the elevated removal path calls this after SCM deletion is proved.
+    internal void ClearRemovalFenceAfterServiceDeletion()
+    {
+        if (!HasRemovalFence()) throw new IOException("SERVICE_REMOVE_FENCE_UNVERIFIED");
+        File.Delete(RemovalFencePath);
+        if (HasRemovalFence()) throw new IOException("SERVICE_REMOVE_FENCE_UNVERIFIED");
     }
 
     internal static void EnsureNoReparsePoints(string target)

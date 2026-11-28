@@ -29,6 +29,17 @@ describe('Windows installer scope regression', () => {
     expect(installerScript.indexOf('!macro customInit')).toBeLessThan(installerScript.indexOf('!macro customInstall'));
   });
 
+  it('checks the protected removal fence before silent uninstall file removal', () => {
+    const start = installerScript.indexOf('!macro customUnInit');
+    const end = installerScript.indexOf('!macroend', start);
+    const init = installerScript.slice(start, end);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(init).toContain('service-rollback-preflight');
+    expect(init).toContain('SetErrorLevel 125');
+    expect(init).toContain('Quit');
+    expect(end).toBeLessThan(installerScript.indexOf('!macro customUnInstall'));
+  });
+
   it('keeps silent update uninstall from waiting on the user-data prompt', () => {
     const silentGuard = installerScript.indexOf('IfSilent keepData 0');
     const prompt = installerScript.indexOf('MessageBox MB_YESNO|MB_ICONQUESTION');

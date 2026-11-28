@@ -104,6 +104,68 @@ internal sealed class ServiceAttemptLedger
 
     internal string? ImportStoreDirectory { get; }
     internal string? OutputStoreDirectory => persistence?.OutputStoreDirectory;
+    internal bool HasRemovalFence => persistence?.HasRemovalFence() ?? false;
+
+    // Called under the service-wide admission gate, with no RPC in flight.
+    // Inspect both protected stores without synthesizing a terminal receipt.
+    internal void AssertRemovalSafe()
+    {
+        lock (gate)
+        {
+            EnsureAvailable();
+            if (persistence is null) throw new IOException("SERVICE_REMOVE_LEDGER_UNVERIFIED");
+            foreach (var entry in attempts.Values)
+            {
+                if (entry.ReservationHeld || entry.Request.HoldForImport
+                    || entry.Phase is not (ServiceAttemptPhase.LaunchNotStarted or ServiceAttemptPhase.TerminalVerified))
+                    throw new IOException("SERVICE_REMOVE_ATTEMPTS_UNRESOLVED");
+                // Even a terminal row must not hide an extant native Job.
+                RequireAbsentJob(entry.Request.Identity);
+            }
+
+            var durable = persistence.Load(requireLegacySchema: true)
+                .ToDictionary(row => row.Request.Identity.AttemptId, StringComparer.Ordinal);
+            if (durable.Count != attempts.Count) throw new IOException("SERVICE_REMOVE_LEDGER_UNVERIFIED");
+            foreach (var entry in attempts.Values)
+            {
+                var expected = Snapshot(entry) with { Request = entry.Request with { NativeDispatchBootId = null } };
+                if (!durable.TryGetValue(entry.Request.Identity.AttemptId, out var row)
+                    || row != expected)
+                    throw new IOException("SERVICE_REMOVE_LEDGER_UNVERIFIED");
+            }
+
+            var witnesses = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var stored in persistence.LoadManagedWriterWitnesses())
+            {
+                var identity = stored.Request.Identity;
+                var witness = ReadManagedWitness(identity, stored.Request.AuthenticatedCallerSid)
+                    ?? throw new IOException("SERVICE_REMOVE_WITNESS_UNVERIFIED");
+                if (!IsVerifiedWitness(witness) || witness.ReservationHeld
+                    || !attempts.TryGetValue(identity.AttemptId, out var main)
+                    || main.Request.Identity != identity
+                    || main.Request.AuthenticatedCallerSid != witness.Request.AuthenticatedCallerSid
+                    || main.Phase != witness.Phase || main.TargetPid != witness.TargetPid
+                    || main.Outcome != witness.Outcome || main.ExitCode != witness.ExitCode
+                    || main.ActiveProcesses != witness.ActiveProcesses
+                    || !witnesses.Add(identity.AttemptId))
+                    throw new IOException("SERVICE_REMOVE_WITNESS_UNVERIFIED");
+                RequireAbsentJob(identity);
+            }
+            if (attempts.Values.Any(entry => IsManagedWriter(entry.Request.Identity)
+                && !witnesses.Contains(entry.Request.Identity.AttemptId)))
+                throw new IOException("SERVICE_REMOVE_WITNESS_UNVERIFIED");
+        }
+    }
+
+    internal void FenceRemoval()
+    {
+        lock (gate)
+        {
+            EnsureAvailable();
+            if (persistence is null) throw new IOException("SERVICE_REMOVE_LEDGER_UNVERIFIED");
+            persistence.FenceRemoval();
+        }
+    }
 
     internal ServiceAttemptLedger(ServiceAttemptLedgerPersistence persistence, string? importStoreDirectory = null)
     {

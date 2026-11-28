@@ -236,6 +236,38 @@ internal static class WindowsContainmentServiceInstaller
         }
     }
 
+    internal static void PrepareManualRemoval()
+    {
+        EnsureWindows();
+        var image = Path.GetFullPath(Environment.ProcessPath ?? throw new IOException("SERVICE_REMOVE_IMAGE_UNAVAILABLE"));
+        var programs = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
+        var root = ValidateImagePath(image, programs);
+        EnsureNoReparsePoints(image);
+        VerifyProtectedAncestors(root, programs);
+        VerifyPackageManifest(image);
+        try
+        {
+            var request = JsonSerializer.SerializeToUtf8Bytes(new { protocol = 3, command = "prepare_manual_removal" });
+            var response = WindowsContainmentServiceClient.SendAsync(HashFile(image), request).GetAwaiter().GetResult();
+            using var document = JsonDocument.Parse(response);
+            var reply = document.RootElement;
+            if (reply.GetProperty("protocol").GetInt32() != 3)
+                throw new IOException("SERVICE_REMOVE_PREFLIGHT_UNVERIFIED");
+            if (!reply.GetProperty("ok").GetBoolean())
+            {
+                var reason = reply.GetProperty("error").GetString();
+                throw new IOException(reason is not null && reason.StartsWith("SERVICE_REMOVE_", StringComparison.Ordinal)
+                    ? reason : "SERVICE_REMOVE_PREFLIGHT_UNVERIFIED");
+            }
+            if (reply.GetProperty("result").GetProperty("kind").GetString() != "manual_removal_fenced")
+                throw new IOException("SERVICE_REMOVE_PREFLIGHT_UNVERIFIED");
+        }
+        catch (Exception exception) when (exception is not IOException io || !io.Message.StartsWith("SERVICE_REMOVE_", StringComparison.Ordinal))
+        {
+            throw new IOException("SERVICE_REMOVE_PREFLIGHT_UNVERIFIED", exception);
+        }
+    }
+
     internal static void Uninstall()
     {
         EnsureWindows();
@@ -246,12 +278,17 @@ internal static class WindowsContainmentServiceInstaller
         {
             var error = Marshal.GetLastWin32Error();
             service.Dispose();
-            if (error == ErrorServiceDoesNotExist) return;
+            // Missing SCM identity cannot prove safe removal of retained data.
+            if (error == ErrorServiceDoesNotExist) throw new IOException("SERVICE_REMOVE_SERVICE_UNAVAILABLE");
             throw new IOException("SERVICE_REMOVE_OPEN_FAILED");
         }
 
         using (service)
         {
+            if (!String.Equals(QueryImagePath(service), Path.GetFullPath(Environment.ProcessPath
+                ?? throw new IOException("SERVICE_REMOVE_IMAGE_UNAVAILABLE")), StringComparison.OrdinalIgnoreCase))
+                throw new IOException("SERVICE_REMOVE_IMAGE_MISMATCH");
+            PrepareManualRemoval(); // freeze before SCM stop; repeat after an earlier NSIS preflight
             StopAndWait(service);
             if (!DeleteService(service))
             {
@@ -264,6 +301,9 @@ internal static class WindowsContainmentServiceInstaller
         // be present while SCM holds its final references, and NSIS must not
         // proceed to delete its protected image until disappearance is proven.
         WaitForServiceDeletion(manager);
+        var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "lnwjud-containment");
+        VerifyTrustedAcl(new DirectoryInfo(directory));
+        new ServiceAttemptLedgerPersistence(Path.Combine(directory, "attempts.json")).ClearRemovalFenceAfterServiceDeletion();
     }
 
     private static void WaitForServiceDeletion(SafeServiceHandle manager)
